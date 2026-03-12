@@ -33,14 +33,18 @@ LIGHT_GRID_Y = 5  # 纵向光线数
 # 立方体尺寸 (米) - 设为 None 则自动根据投影尺寸计算
 CUBE_WIDTH = None   # 自定义宽度，None 表示自动计算
 CUBE_HEIGHT = None  # 自定义高度，None 表示自动计算
-CUBE_DEPTH = 0.1    # 立方体厚度
+CUBE_DEPTH = 0.5    # 立方体厚度
 
 # 自动计算时的缩放因子（当尺寸为 None 时使用）
 CUBE_SCALE_FACTOR = 1.2  # 比投影面积大 20%
 
 # 透明度设置 (0 = 完全透明, 1 = 完全不透明)
-CUBE_ALPHA = 0.1   # 透明度
-CUBE_COLOR = (0.8, 0.9, 1.0, 1.0)  # 立方体颜色 (RGBA)
+CUBE_ALPHA = 0.8   # 透明度
+CUBE_COLOR = (1, 0.9, 1.0, 1.0)  # 立方体颜色 (RGBA)
+
+# 线框设置
+WIREFRAME_THICKNESS = 0.015  # 线框粗细 (米)
+WIREFRAME_COLOR = (0.3, 0.5, 0.8, 1.0)  # 线框颜色 (RGBA)
 
 # ========== 创建投影仪 ==========
 bpy.ops.mesh.primitive_cube_add(size=1)
@@ -78,7 +82,7 @@ def create_light_ray(name, origin, direction, length):
 
     curve_data = bpy.data.curves.new(name=name, type='CURVE')
     curve_data.dimensions = '3D'
-    curve_data.bevel_depth = LIGHT_RADIUS
+    curve_data.bevel_depth = 0  # 纯线条，无粗细
 
     spline = curve_data.splines.new('POLY')
     spline.points.add(1)
@@ -247,6 +251,67 @@ links.new(principled.outputs['BSDF'], output_node.inputs['Surface'])
 
 # 应用材质到立方体
 projection_cube.data.materials.append(mat_transparent)
+
+# ========== 创建线框边框 ==========
+# 计算立方体8个顶点位置
+hw, hh, hd = cube_width / 2, cube_height / 2, cube_depth / 2
+cx, cy, cz = projection_plane_center.x, projection_plane_center.y, projection_plane_center.z
+
+vertices = [
+    (cx - hw, cy - hd, cz - hh),  # 0: 后下左
+    (cx + hw, cy - hd, cz - hh),  # 1: 后下右
+    (cx + hw, cy + hd, cz - hh),  # 2: 前下右
+    (cx - hw, cy + hd, cz - hh),  # 3: 前下左
+    (cx - hw, cy - hd, cz + hh),  # 4: 后上左
+    (cx + hw, cy - hd, cz + hh),  # 5: 后上右
+    (cx + hw, cy + hd, cz + hh),  # 6: 前上右
+    (cx - hw, cy + hd, cz + hh),  # 7: 前上左
+]
+
+# 立方体12条边的顶点索引
+edges = [
+    (0, 1), (1, 2), (2, 3), (3, 0),  # 底面
+    (4, 5), (5, 6), (6, 7), (7, 4),  # 顶面
+    (0, 4), (1, 5), (2, 6), (3, 7),  # 竖边
+]
+
+# 创建线框材质
+mat_wireframe = bpy.data.materials.new(name="Mat_Wireframe")
+mat_wireframe.use_nodes = True
+nodes_wf = mat_wireframe.node_tree.nodes
+links_wf = mat_wireframe.node_tree.links
+nodes_wf.clear()
+
+output_wf = nodes_wf.new('ShaderNodeOutputMaterial')
+emission_wf = nodes_wf.new('ShaderNodeEmission')
+emission_wf.inputs['Color'].default_value = WIREFRAME_COLOR
+emission_wf.inputs['Strength'].default_value = 3.0
+links_wf.new(emission_wf.outputs['Emission'], output_wf.inputs['Surface'])
+
+# 创建线条
+wireframe_lines = []
+for i, (v1_idx, v2_idx) in enumerate(edges):
+    curve_data = bpy.data.curves.new(name=f"CubeEdge_{i}", type='CURVE')
+    curve_data.dimensions = '3D'
+    curve_data.bevel_depth = 0  # 纯线条，无粗细
+
+    spline = curve_data.splines.new('POLY')
+    spline.points.add(1)
+    spline.points[0].co = (*vertices[v1_idx], 1)
+    spline.points[1].co = (*vertices[v2_idx], 1)
+
+    curve_obj = bpy.data.objects.new(f"CubeEdge_{i}", curve_data)
+    bpy.context.collection.objects.link(curve_obj)
+    curve_obj.data.materials.append(mat_wireframe)
+    wireframe_lines.append(curve_obj)
+
+# 创建空对象作为线框的父对象
+wireframe_parent = bpy.data.objects.new("CubeWireframe", None)
+bpy.context.collection.objects.link(wireframe_parent)
+wireframe_parent.location = (0, 0, 0)  # 父对象在原点，避免坐标偏移
+
+for line in wireframe_lines:
+    line.parent = wireframe_parent
 
 # ========== 输出信息 ==========
 print("=" * 50)
