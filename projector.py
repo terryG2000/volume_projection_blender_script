@@ -34,6 +34,8 @@ IMAGE_FILL = 0.84
 BUBBLE_DEPTH_LAYERS = 7
 BUBBLE_RADIUS = 0.027
 BACKGROUND_BUBBLE_RATE = 0.02 if FAST_PREVIEW else 0.13
+SHOW_BACKGROUND_BUBBLES = False
+BUBBLE_PATH_RAY_LIMIT = 160 if FAST_PREVIEW else 260
 
 RAY_GRID_X = 6 if FAST_PREVIEW else 13
 RAY_GRID_Z = 4 if FAST_PREVIEW else 9
@@ -639,7 +641,7 @@ class BubbleField:
         for ix in range(IMAGE_GRID_X):
             for iz in range(IMAGE_GRID_Z):
                 active, color, brightness = pattern_pixel(ix, iz, IMAGE_GRID_X, IMAGE_GRID_Z)
-                background = (not active) and stable_hash(ix, iz, 7) < BACKGROUND_BUBBLE_RATE
+                background = SHOW_BACKGROUND_BUBBLES and (not active) and stable_hash(ix, iz, 7) < BACKGROUND_BUBBLE_RATE
                 if not active and not background:
                     continue
 
@@ -660,7 +662,7 @@ class BubbleField:
                     radius = BUBBLE_RADIUS * (0.35 + stable_hash(ix, iz, 8) * 0.25)
                     gray = 0.45 + stable_hash(ix, iz, 9) * 0.25
                     bubble_color = (gray, gray, gray, 0.72)
-                    name = f"BubblePixel_Background_{ix:02d}_{iz:02d}"
+                    name = f"NoiseBubble_Background_{ix:02d}_{iz:02d}"
 
                 bubble = self._create_linked_object(
                     name,
@@ -703,6 +705,34 @@ def create_projection_rays(
     create_frustum_mesh("Projected_Light_Frustum", lens, far_corners, materials["frustum"], collection)
     return rays
 
+def create_ray_aligned_bubble_paths(
+    projector: Projector,
+    bubble_field: BubbleField,
+    collection: bpy.types.Collection,
+    materials: Dict[str, bpy.types.Material],
+) -> List[bpy.types.Object]:
+    """显示从投影仪镜头到有效气泡体素的光线路径。"""
+    paths: List[bpy.types.Object] = []
+    active_bubbles = bubble_field.active_bubbles
+    if not active_bubbles:
+        return paths
+
+    stride = max(1, len(active_bubbles) // BUBBLE_PATH_RAY_LIMIT)
+    selected = active_bubbles[::stride][:BUBBLE_PATH_RAY_LIMIT]
+    lens = projector.lens_position
+
+    for index, bubble in enumerate(selected):
+        paths.append(
+            create_curve(
+                f"RayAligned_Bubble_Path_{index:03d}",
+                (lens, Vector(bubble.location)),
+                materials["bubble_path_ray"],
+                0.0016,
+                collection,
+            )
+        )
+
+    return paths
 
 def create_scattering_rays(
     bubble_field: BubbleField,
@@ -846,6 +876,7 @@ def build_materials() -> Dict[str, bpy.types.Material]:
         "glass": create_glass_material("Mat_Transparent_Glass_Cube", (0.72, 0.92, 1.0, 1.0), CUBE_ALPHA),
         "wire": create_emission_material("Mat_Glass_Cube_Wireframe", (0.55, 0.75, 0.95, 1.0), 0.7),
         "ray": create_emission_material("Mat_Projector_Thin_Rays", (0.02, 0.018, 0.012, 1.0), 0.35),
+        "bubble_path_ray": create_emission_material("Mat_Ray_Aligned_Bubble_Paths", (1.0, 0.82, 0.18, 1.0), 1.15),
         "frustum": create_glass_material("Mat_Faint_Yellow_Light_Frustum", (1.0, 0.84, 0.18, 1.0), 0.08),
         "scatter": create_emission_material("Mat_Bubble_Scatter_White", (0.92, 0.98, 1.0, 1.0), 3.6),
         "scatter_side": create_emission_material("Mat_Bubble_Scatter_Cyan", (0.35, 0.92, 1.0, 1.0), 2.4),
@@ -899,6 +930,9 @@ def build_scene() -> Dict[str, object]:
     log_step(f"创建入射光线: {RAY_GRID_X} x {RAY_GRID_Z}...")
     create_projection_rays(projector, volume, collections["rays"], materials)
 
+    log_step("创建气泡路径验证光线...")
+    create_ray_aligned_bubble_paths(projector, bubble_field, collections["rays"], materials)
+
     log_step("创建气泡散射光线...")
     create_scattering_rays(bubble_field, camera_location, collections["rays"], materials)
 
@@ -913,6 +947,7 @@ def build_scene() -> Dict[str, object]:
     print(f"投影像素网格: {IMAGE_GRID_X} x {IMAGE_GRID_Z}")
     print(f"气泡总数: {len(bubble_field.bubbles)}")
     print(f"有效发光气泡: {len(bubble_field.active_bubbles)}")
+    print(f"背景杂散气泡: {len(bubble_field.bubbles) - len(bubble_field.active_bubbles)}")
     print(f"深度层数: {BUBBLE_DEPTH_LAYERS}")
     print("对象已按 01_Projector / 02_Glass_Volume / 03_Light_Rays / 04_Bubble_Pixels 分组。")
     print("=" * 72)
