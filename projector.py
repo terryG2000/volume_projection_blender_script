@@ -7,6 +7,8 @@
 """
 
 import math
+import sys
+from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import bpy
@@ -36,6 +38,10 @@ BACKGROUND_BUBBLE_RATE = 0.02 if FAST_PREVIEW else 0.13
 RAY_GRID_X = 6 if FAST_PREVIEW else 13
 RAY_GRID_Z = 4 if FAST_PREVIEW else 9
 SCATTER_SAMPLE_LIMIT = 18 if FAST_PREVIEW else 90
+
+OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
+PREVIEW_IMAGE_PATH = OUTPUT_DIR / "volume_projection_preview.png"
+PREVIEW_BLEND_PATH = OUTPUT_DIR / "volume_projection_scene.blend"
 
 
 # ========== 通用工具 ==========
@@ -813,10 +819,10 @@ def setup_scene(camera_target: Vector) -> Vector:
     glint.data.energy = 80
     glint.data.color = (0.72, 0.88, 1.0)
 
-    bpy.ops.object.camera_add(location=(4.7, 2.45, 3.0))
+    bpy.ops.object.camera_add(location=(-5.6, 3.4, 3.05))
     camera = bpy.context.object
     camera.name = "Camera_Overview"
-    camera.data.lens = 34
+    camera.data.lens = 28
     look_at(camera, camera_target)
     scene.camera = camera
 
@@ -853,7 +859,7 @@ def build_materials() -> Dict[str, bpy.types.Material]:
     }
 
 
-def build_scene() -> None:
+def build_scene() -> Dict[str, object]:
     log_step("开始生成体积投影场景。")
     scene_clear()
 
@@ -911,6 +917,39 @@ def build_scene() -> None:
     print("对象已按 01_Projector / 02_Glass_Volume / 03_Light_Rays / 04_Bubble_Pixels 分组。")
     print("=" * 72)
 
+    return {
+        "projector": projector,
+        "volume": volume,
+        "bubble_field": bubble_field,
+    }
+
+def get_script_args() -> List[str]:
+    if "--" not in sys.argv:
+        return []
+    return sys.argv[sys.argv.index("--") + 1:]
+
+
+def render_preview(output_path: Path = PREVIEW_IMAGE_PATH) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+
+    scene = bpy.context.scene
+    scene.render.resolution_x = 1280
+    scene.render.resolution_y = 820
+    scene.render.film_transparent = False
+    scene.render.filepath = str(output_path)
+    scene.render.image_settings.file_format = "PNG"
+
+    log_step(f"渲染验证预览图: {output_path}")
+    bpy.ops.render.render(write_still=True)
+    return output_path
+
+
+def save_blend_file(output_path: Path = PREVIEW_BLEND_PATH) -> Path:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    log_step(f"保存 Blender 场景文件: {output_path}")
+    bpy.ops.wm.save_as_mainfile(filepath=str(output_path))
+    return output_path
+
 
 def main() -> None:
     window_manager = bpy.context.window_manager
@@ -918,9 +957,14 @@ def main() -> None:
         log_step("检测到脚本已经在运行，本次重复启动已跳过。")
         return
 
+    args = get_script_args()
     window_manager[RUNNING_FLAG_KEY] = True
     try:
         build_scene()
+        if "--render-preview" in args:
+            render_preview()
+        if "--save-blend" in args:
+            save_blend_file()
     finally:
         window_manager[RUNNING_FLAG_KEY] = False
 
