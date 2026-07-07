@@ -4,6 +4,11 @@
 
 在 Blender 中运行本脚本，会创建一个普通投影仪向透明玻璃立方体投影的场景。
 立方体内部的微小气泡按投影图案和深度层分布，每个气泡代表一个可散射光的体素/像素点。
+
+GUI 保留窗口运行示例：
+    blender.exe --python projector.py -- --keep-open
+后台导出预览图示例：
+    blender.exe --background --python projector.py -- --render-preview
 """
 
 import math
@@ -957,6 +962,47 @@ def build_scene() -> Dict[str, object]:
         "volume": volume,
         "bubble_field": bubble_field,
     }
+def select_projector_for_manual_adjustment(scene_data: Dict[str, object]) -> None:
+    projector = scene_data.get("projector")
+    projector_obj = getattr(projector, "object", None)
+    if projector_obj is None:
+        return
+
+    bpy.ops.object.select_all(action="DESELECT")
+    projector_obj.select_set(True)
+    bpy.context.view_layer.objects.active = projector_obj
+
+    projector_obj["manual_adjustment_note"] = (
+        "Move this Projector_Body object to adjust the projector location. "
+        "Run the script again after large moves to regenerate ray-aligned bubble paths."
+    )
+
+    if bpy.app.background:
+        log_step("--keep-open 需要 GUI 模式；当前是 --background，Blender 会在脚本结束后退出。")
+        return
+
+    for area in bpy.context.screen.areas:
+        if area.type != "VIEW_3D":
+            continue
+        region = next((region for region in area.regions if region.type == "WINDOW"), None)
+        space = next((space for space in area.spaces if space.type == "VIEW_3D"), None)
+        if region is None or space is None:
+            continue
+        override = {
+            "window": bpy.context.window,
+            "screen": bpy.context.screen,
+            "area": area,
+            "region": region,
+            "space_data": space,
+        }
+        try:
+            with bpy.context.temp_override(**override):
+                bpy.ops.view3d.view_selected(use_all_regions=False)
+        except Exception:
+            pass
+        break
+
+    log_step("生成完成：Blender 窗口会保留，已选中 Projector_Body，可手动调整投影仪位置。")
 
 def get_script_args() -> List[str]:
     if "--" not in sys.argv:
@@ -995,7 +1041,9 @@ def main() -> None:
     args = get_script_args()
     window_manager[RUNNING_FLAG_KEY] = True
     try:
-        build_scene()
+        scene_data = build_scene()
+        if "--keep-open" in args:
+            select_projector_for_manual_adjustment(scene_data)
         if "--render-preview" in args:
             render_preview()
         if "--save-blend" in args:
