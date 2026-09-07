@@ -12,12 +12,14 @@ GUI 保留窗口运行示例：
 """
 
 import math
+import csv
+import random
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import bpy
-from mathutils import Vector
+from mathutils import Matrix, Vector
 
 
 # ========== 场景参数 ==========
@@ -38,9 +40,9 @@ IMAGE_GRID_Z = 10 if FAST_PREVIEW else 22
 IMAGE_FILL = 0.84
 BUBBLE_DEPTH_LAYERS = 7
 BUBBLE_RADIUS = 0.027
-BACKGROUND_BUBBLE_RATE = 0.02 if FAST_PREVIEW else 0.13
-SHOW_BACKGROUND_BUBBLES = False
 BUBBLE_PATH_RAY_LIMIT = 160 if FAST_PREVIEW else 260
+SCENE_VERSION = 2
+DEPTH_SEED = 2006
 
 RAY_GRID_X = 6 if FAST_PREVIEW else 13
 RAY_GRID_Z = 4 if FAST_PREVIEW else 9
@@ -66,7 +68,7 @@ def set_input(node, names: Sequence[str], value) -> bool:
 
 
 def ensure_collection(name: str) -> bpy.types.Collection:
-    collection = bpy.data.collections.get(name)
+    collection = bpy.context.scene.collection.children.get(name)
     if collection is None:
         collection = bpy.data.collections.new(name)
         bpy.context.scene.collection.children.link(collection)
@@ -91,6 +93,7 @@ def look_at(obj: bpy.types.Object, target: Vector) -> None:
 
 
 def set_parent_keep_transform(child: bpy.types.Object, parent: bpy.types.Object) -> None:
+    bpy.context.view_layer.update()
     world_matrix = child.matrix_world.copy()
     child.parent = parent
     child.matrix_parent_inverse = parent.matrix_world.inverted()
@@ -119,20 +122,22 @@ def prepare_blender_context() -> None:
     except Exception:
         pass
 
-    try:
-        bpy.ops.wm.tool_set_by_id(name="builtin.select")
-    except Exception:
-        pass
+    if not bpy.app.background:
+        try:
+            bpy.ops.wm.tool_set_by_id(name="builtin.select")
+        except Exception:
+            pass
 
 
 def scene_clear() -> None:
     prepare_blender_context()
     log_step("清理旧场景...")
-    bpy.ops.object.select_all(action="SELECT")
-    bpy.ops.object.delete()
+    for obj in list(bpy.context.scene.objects):
+        if obj.get("vp_generated"):
+            bpy.data.objects.remove(obj, do_unlink=True)
 
     for mesh in list(bpy.data.meshes):
-        if mesh.users == 0 or mesh.name.startswith(("ProjectedPixel_TemplateMesh", "BubblePixel_TemplateMesh")):
+        if mesh.users == 0:
             bpy.data.meshes.remove(mesh)
 
     for material in list(bpy.data.materials):
@@ -399,6 +404,8 @@ class Projector:
 
     @property
     def lens_position(self) -> Vector:
+        if self.lens_marker is not None:
+            return self.lens_marker.matrix_world.translation.copy()
         return Vector((self.location.x, self.location.y - self.depth / 2 - 0.08, self.location.z))
 
     def create(self, collection: bpy.types.Collection, materials: Dict[str, bpy.types.Material]) -> bpy.types.Object:
@@ -408,7 +415,7 @@ class Projector:
         top_y = self.location.y + 0.04
         top_z = self.location.z + self.height / 2 + 0.055
         for index in range(8):
-            x = -self.width * 0.38 + index * (self.width * 0.76 / 7)
+            x = self.location.x - self.width * 0.38 + index * (self.width * 0.76 / 7)
             fin = add_cube(
                 f"Projector_CoolingFin_{index:02d}",
                 (x, top_y, top_z),
@@ -439,6 +446,8 @@ class Projector:
         marker.data.materials.append(materials["lens_core"])
         self.lens_marker = link_to_collection(marker, collection)
         set_parent_keep_transform(self.lens_marker, body)
+        bpy.context.view_layer.update()
+        body.lock_scale = (True, True, True)
 
         return body
 
@@ -596,10 +605,14 @@ class BubbleField:
         self.pattern_pixels: List[bpy.types.Object] = []
 
     def _depth_fraction(self, ix: int, iz: int) -> float:
-        layer = (ix * 3 + iz * 5) % BUBBLE_DEPTH_LAYERS
+        # Permute depths among adjacent rays; never jitter off the pixel ray.
+        group, slot = divmod(ix, BUBBLE_DEPTH_LAYERS)
+        layers = list(range(BUBBLE_DEPTH_LAYERS))
+        random.Random(DEPTH_SEED + iz * 1009 + group * 9176).shuffle(layers)
+        layer = layers[slot]
         base = (layer + 0.5) / BUBBLE_DEPTH_LAYERS
-        jitter = (stable_hash(ix, iz, 4) - 0.5) * 0.08
-        return clamp(base + jitter, 0.08, 0.92)
+        jitter = (stable_hash(ix, iz, 4) - 0.5) * 0.5 / BUBBLE_DEPTH_LAYERS
+        return base + jitter
 
     def _create_linked_object(
         self,
@@ -626,9 +639,6 @@ class BubbleField:
         for ix in range(IMAGE_GRID_X):
             for iz in range(IMAGE_GRID_Z):
                 active, color, brightness = pattern_pixel(ix, iz, IMAGE_GRID_X, IMAGE_GRID_Z)
-                if not active:
-                    continue
-
                 target = self.volume.target_on_far_face(ix, iz, IMAGE_GRID_X, IMAGE_GRID_Z)
                 pixel = self._create_linked_object(
                     f"Projected_Image_Pixel_{ix:02d}_{iz:02d}",
@@ -639,6 +649,10 @@ class BubbleField:
                     collection,
                 )
                 self.pattern_pixels.append(pixel)
+                pixel["vp_role"] = "image"
+                pixel["pixel_x"] = ix
+                pixel["pixel_z"] = iz
+                pixel["vp_reference_target"] = list(target)
 
         return self.pattern_pixels
 
@@ -646,16 +660,12 @@ class BubbleField:
         for ix in range(IMAGE_GRID_X):
             for iz in range(IMAGE_GRID_Z):
                 active, color, brightness = pattern_pixel(ix, iz, IMAGE_GRID_X, IMAGE_GRID_Z)
-                background = SHOW_BACKGROUND_BUBBLES and (not active) and stable_hash(ix, iz, 7) < BACKGROUND_BUBBLE_RATE
-                if not active and not background:
-                    continue
-
                 target = self.volume.target_on_far_face(ix, iz, IMAGE_GRID_X, IMAGE_GRID_Z)
                 depth_fraction = self._depth_fraction(ix, iz)
                 position = self.volume.ray_point_at_depth(self.projector.lens_position, target, depth_fraction)
 
                 if active:
-                    radius = BUBBLE_RADIUS * (0.78 + 0.55 * brightness)
+                    radius = BUBBLE_RADIUS
                     bubble_color = (
                         clamp(color[0] * (0.75 + brightness * 0.4), 0.0, 1.0),
                         clamp(color[1] * (0.75 + brightness * 0.4), 0.0, 1.0),
@@ -664,10 +674,15 @@ class BubbleField:
                     )
                     name = f"BubblePixel_Active_{ix:02d}_{iz:02d}_L{int(depth_fraction * BUBBLE_DEPTH_LAYERS):02d}"
                 else:
-                    radius = BUBBLE_RADIUS * (0.35 + stable_hash(ix, iz, 8) * 0.25)
-                    gray = 0.45 + stable_hash(ix, iz, 9) * 0.25
-                    bubble_color = (gray, gray, gray, 0.72)
-                    name = f"NoiseBubble_Background_{ix:02d}_{iz:02d}"
+                    radius = BUBBLE_RADIUS
+                    bubble_color = (0.008, 0.008, 0.008, 1.0)
+                    name = f"BubblePixel_Dark_{ix:02d}_{iz:02d}"
+
+                # Keep each finite sphere inside its own projected pixel footprint.
+                magnification = (position.y - self.projector.lens_position.y) / (target.y - self.projector.lens_position.y)
+                pitch = min(self.volume.size.x * IMAGE_FILL / (IMAGE_GRID_X - 1),
+                            self.volume.size.z * IMAGE_FILL / (IMAGE_GRID_Z - 1))
+                radius = min(radius, pitch * magnification * 0.22)
 
                 bubble = self._create_linked_object(
                     name,
@@ -678,6 +693,12 @@ class BubbleField:
                     collection,
                 )
                 self.bubbles.append(bubble)
+                bubble["vp_role"] = "bubble"
+                bubble["pixel_x"] = ix
+                bubble["pixel_z"] = iz
+                bubble["depth_fraction"] = depth_fraction
+                bubble["vp_lit"] = active
+                bubble["vp_reference_target"] = list(target)
                 if active:
                     self.active_bubbles.append(bubble)
 
@@ -700,6 +721,9 @@ def create_projection_rays(
             target = volume.target_on_far_face(ix, iz, RAY_GRID_X, RAY_GRID_Z)
             name = f"Projector_Ray_{ix:02d}_{iz:02d}"
             rays.append(create_curve(name, (lens, target), materials["ray"], 0.0022, collection))
+            rays[-1]["vp_role"] = "beam"
+            rays[-1]["vp_reference_target"] = list(target)
+            rays[-1]["vp_coarse"] = True
 
     far_corners = (
         volume.target_on_far_face(0, 0, RAY_GRID_X, RAY_GRID_Z),
@@ -707,7 +731,8 @@ def create_projection_rays(
         volume.target_on_far_face(RAY_GRID_X - 1, RAY_GRID_Z - 1, RAY_GRID_X, RAY_GRID_Z),
         volume.target_on_far_face(0, RAY_GRID_Z - 1, RAY_GRID_X, RAY_GRID_Z),
     )
-    create_frustum_mesh("Projected_Light_Frustum", lens, far_corners, materials["frustum"], collection)
+    frustum = create_frustum_mesh("Projected_Light_Frustum", lens, far_corners, materials["frustum"], collection)
+    frustum["vp_role"] = "frustum"
     return rays
 
 def create_ray_aligned_bubble_paths(
@@ -718,7 +743,7 @@ def create_ray_aligned_bubble_paths(
 ) -> List[bpy.types.Object]:
     """显示从投影仪镜头到有效气泡体素的光线路径。"""
     paths: List[bpy.types.Object] = []
-    active_bubbles = bubble_field.active_bubbles
+    active_bubbles = bubble_field.bubbles
     if not active_bubbles:
         return paths
 
@@ -730,12 +755,16 @@ def create_ray_aligned_bubble_paths(
         paths.append(
             create_curve(
                 f"RayAligned_Bubble_Path_{index:03d}",
-                (lens, Vector(bubble.location)),
+                (lens, Vector(bubble["vp_reference_target"])),
                 materials["bubble_path_ray"],
                 0.0016,
                 collection,
             )
         )
+        paths[-1]["vp_role"] = "beam"
+        paths[-1]["vp_reference_target"] = bubble["vp_reference_target"]
+        paths[-1]["pixel_x"] = bubble["pixel_x"]
+        paths[-1]["pixel_z"] = bubble["pixel_z"]
 
     return paths
 
@@ -773,6 +802,8 @@ def create_scattering_rays(
                 collection,
             )
         )
+        scatter[-1]["vp_role"] = "scatter"
+        scatter[-1]["vp_bubble"] = bubble.name
         if index % 3 == 0:
             scatter.append(
                 create_curve(
@@ -783,6 +814,8 @@ def create_scattering_rays(
                     collection,
                 )
             )
+            scatter[-1]["vp_role"] = "scatter"
+            scatter[-1]["vp_bubble"] = bubble.name
 
     return scatter
 
@@ -808,6 +841,7 @@ def create_laser_written_guides(
                 collection,
             )
         )
+        guides[-1]["vp_role"] = "writing"
     return guides
 
 
@@ -897,6 +931,10 @@ def build_materials() -> Dict[str, bpy.types.Material]:
 
 def build_scene() -> Dict[str, object]:
     log_step("开始生成体积投影场景。")
+    if bpy.context.scene.get("vp_version") != SCENE_VERSION:
+        bpy.context.window.scene = bpy.data.scenes.new("VolumeProjection")
+    scene = bpy.context.scene
+    previous_objects = set(scene.objects)
     scene_clear()
 
     log_step("创建集合分组...")
@@ -944,6 +982,13 @@ def build_scene() -> Dict[str, object]:
     log_step("创建激光写入辅助路径...")
     create_laser_written_guides(volume, collections["rays"], materials)
 
+    bpy.context.view_layer.update()
+    for obj in scene.objects:
+        if obj not in previous_objects:
+            obj["vp_generated"] = True
+    initialize_projection(projector, volume)
+    update_projection()
+
     print("=" * 72)
     print("体积投影仿真场景创建完成")
     print(f"投影仪镜头位置: {tuple(round(v, 3) for v in projector.lens_position)}")
@@ -952,7 +997,7 @@ def build_scene() -> Dict[str, object]:
     print(f"投影像素网格: {IMAGE_GRID_X} x {IMAGE_GRID_Z}")
     print(f"气泡总数: {len(bubble_field.bubbles)}")
     print(f"有效发光气泡: {len(bubble_field.active_bubbles)}")
-    print(f"背景杂散气泡: {len(bubble_field.bubbles) - len(bubble_field.active_bubbles)}")
+    print(f"未照亮的固定气泡: {len(bubble_field.bubbles) - len(bubble_field.active_bubbles)}")
     print(f"深度层数: {BUBBLE_DEPTH_LAYERS}")
     print("对象已按 01_Projector / 02_Glass_Volume / 03_Light_Rays / 04_Bubble_Pixels 分组。")
     print("=" * 72)
@@ -962,9 +1007,292 @@ def build_scene() -> Dict[str, object]:
         "volume": volume,
         "bubble_field": bubble_field,
     }
+
+
+def projection_body():
+    return bpy.context.scene.objects.get(bpy.context.scene.get("vp_body", ""))
+
+
+def initialize_projection(projector, volume):
+    scene = bpy.context.scene
+    body = projector.object
+    inverse = body.matrix_world.inverted()
+    lens = inverse @ projector.lens_position
+    origin = inverse @ volume.target_on_far_face(0, 0, IMAGE_GRID_X, IMAGE_GRID_Z)
+    corner = inverse @ volume.target_on_far_face(IMAGE_GRID_X - 1, IMAGE_GRID_Z - 1, IMAGE_GRID_X, IMAGE_GRID_Z)
+    body["vp_lens_local"] = list(lens)
+    body["vp_plane_origin"] = list(origin)
+    body["vp_plane_span"] = [corner.x - origin.x, corner.z - origin.z]
+    body["vp_grid"] = [IMAGE_GRID_X, IMAGE_GRID_Z]
+    body["vp_calibration_matrix"] = [value for row in body.matrix_world for value in row]
+    body["power"] = 1.0
+    body.id_properties_ui("power").update(min=0.0, max=5.0)
+    scene["vp_version"] = SCENE_VERSION
+    scene["vp_body"] = body.name
+    scene["vp_content"] = "TEST"
+    scene["vp_auto"] = True
+    scene["vp_show_rays"] = True
+    scene["vp_show_scatter"] = False
+    scene["vp_show_image"] = False
+    scene["vp_show_layers"] = False
+    for obj in scene.objects:
+        if "vp_reference_target" in obj:
+            obj["vp_target_local"] = list(inverse @ Vector(obj["vp_reference_target"]))
+        if obj.get("vp_role") == "frustum":
+            obj["vp_vertices_local"] = [value for vertex in obj.data.vertices for value in (inverse @ vertex.co)]
+        if obj.get("vp_role") == "bubble":
+            obj["vp_design_position"] = list(obj.matrix_world.translation)
+
+
+def project_to_pixel(body, world_position):
+    """Pinhole inverse projection; refraction and optical PSF are not modeled."""
+    if abs(body.matrix_world.determinant()) < 1e-12:
+        return None
+    point = body.matrix_world.inverted() @ Vector(world_position)
+    lens = Vector(body["vp_lens_local"])
+    plane = Vector(body["vp_plane_origin"])
+    delta = point - lens
+    if delta.y >= -1e-7:
+        return None
+    hit = lens + delta * ((plane.y - lens.y) / delta.y)
+    nx, nz = body["vp_grid"]
+    sx, sz = body["vp_plane_span"]
+    ix = (hit.x - plane.x) / sx * (nx - 1)
+    iz = (hit.z - plane.z) / sz * (nz - 1)
+    # A pixel occupies a finite cell centered on an integer coordinate.
+    if not (-0.5 <= ix < nx - 0.5 and -0.5 <= iz < nz - 0.5):
+        return None
+    return ix, iz
+
+
+def projection_frame(scene, body):
+    nx, nz = body["vp_grid"]
+    mode = scene.get("vp_content", "TEST")
+    depths = {(obj["pixel_x"], obj["pixel_z"]): obj["depth_fraction"]
+              for obj in scene.objects if obj.get("vp_role") == "bubble"}
+    frame = {}
+    for ix in range(nx):
+        for iz in range(nz):
+            if mode == "WHITE":
+                color = (1.0, 1.0, 1.0, 1.0)
+            elif mode == "DEPTH":
+                depth = depths.get((ix, iz), 0.5)
+                color = (depth, 0.2 + 0.7 * (1 - abs(2 * depth - 1)), 1 - depth, 1.0)
+            else:
+                active, rgb, brightness = pattern_pixel(ix, iz, nx, nz)
+                color = tuple(channel * brightness if active else 0.0 for channel in rgb[:3]) + (1.0,)
+            frame[ix, iz] = color
+    return frame
+
+
+def set_visibility(obj, visible):
+    obj.hide_render = not visible
+    obj.hide_set(not visible)
+
+
+def update_projection():
+    scene = bpy.context.scene
+    body = projection_body()
+    if body is None or "vp_lens_local" not in body:
+        return
+    bpy.context.view_layer.update()
+    world = body.matrix_world
+    lens = world @ Vector(body["vp_lens_local"])
+    frame = projection_frame(scene, body)
+    lit_count = 0
+    power = max(0.0, float(body.get("power", 1.0)))
+    for obj in scene.objects:
+        role = obj.get("vp_role")
+        if role == "bubble":
+            sample = project_to_pixel(body, obj.matrix_world.translation)
+            color = frame.get(tuple(math.floor(v + 0.5) for v in sample), (0, 0, 0, 1)) if sample else (0, 0, 0, 1)
+            obj.color = tuple(channel * power for channel in color[:3]) + (1.0,)
+            obj["vp_lit"] = power > 0 and max(color[:3]) > 0.001
+            lit_count += int(obj["vp_lit"])
+        elif role in {"beam", "image"}:
+            target = world @ Vector(obj["vp_target_local"])
+            if role == "beam":
+                points = obj.data.splines[0].points
+                points[0].co = (*lens, 1.0)
+                points[-1].co = (*target, 1.0)
+                signal = frame.get((obj.get("pixel_x", -1), obj.get("pixel_z", -1)), (1, 1, 1, 1))
+                visible = scene.get("vp_show_rays", True) and not obj.get("vp_coarse", False)
+                set_visibility(obj, visible and power > 0 and max(signal[:3]) > 0.001)
+            else:
+                obj.location = target
+                obj.rotation_euler = body.rotation_euler
+                color = frame[obj["pixel_x"], obj["pixel_z"]]
+                obj.color = tuple(channel * power for channel in color[:3]) + (1.0,)
+                set_visibility(obj, scene.get("vp_show_image", False))
+        elif role == "frustum":
+            coordinates = obj["vp_vertices_local"]
+            for i, vertex in enumerate(obj.data.vertices):
+                vertex.co = world @ Vector(coordinates[i * 3:i * 3 + 3])
+            obj.data.update()
+            set_visibility(obj, False)
+        elif role == "writing":
+            set_visibility(obj, False)
+        elif obj.name.startswith("Bubble_Depth_Layer_"):
+            set_visibility(obj, scene.get("vp_show_layers", False))
+        elif obj.name.startswith(("Incoming_Light_Entry_Face", "Projected_Image_Exit_Face")):
+            set_visibility(obj, False)
+    for obj in scene.objects:
+        if obj.get("vp_role") == "scatter":
+            bubble = scene.objects.get(obj.get("vp_bubble", ""))
+            set_visibility(obj, bool(bubble and bubble.get("vp_lit") and scene.get("vp_show_scatter", False)))
+    scene["vp_lit_count"] = lit_count
+    scene["vp_total_count"] = sum(obj.get("vp_role") == "bubble" for obj in scene.objects)
+
+
+def restore_calibration():
+    body = projection_body()
+    values = body["vp_calibration_matrix"]
+    body.matrix_world = Matrix([values[i:i + 4] for i in range(0, 16, 4)])
+    update_projection()
+
+
+def export_projection(output_dir=OUTPUT_DIR):
+    update_projection()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    scene = bpy.context.scene
+    body = projection_body()
+    with (output_dir / "bubble_coordinates.csv").open("w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("name", "pixel_x_calibrated", "pixel_z_calibrated", "depth_fraction",
+                         "x_m", "y_m", "z_m", "pixel_x_current", "pixel_z_current", "lit"))
+        for bubble in sorted((o for o in scene.objects if o.get("vp_role") == "bubble"), key=lambda o: (o["pixel_x"], o["pixel_z"])):
+            position = bubble.matrix_world.translation
+            sample = project_to_pixel(body, position) or ("", "")
+            writer.writerow((bubble.name, bubble["pixel_x"], bubble["pixel_z"], bubble["depth_fraction"],
+                             *position, *sample, int(bubble["vp_lit"])))
+    nx, nz = body["vp_grid"]
+    frame = projection_frame(scene, body)
+    image = bpy.data.images.new("Projection_Input_Export", width=nx, height=nz, alpha=True)
+    try:
+        image.pixels = [channel for iz in range(nz) for ix in range(nx) for channel in frame[ix, iz]]
+        image.filepath_raw = str(output_dir / "projector_input.png")
+        image.file_format = "PNG"
+        image.save()
+    finally:
+        bpy.data.images.remove(image)
+    log_step(f"已导出气泡坐标及投影输入图: {output_dir}")
+
+
+def live_projection_tick():
+    if bpy.app.is_job_running("RENDER") or bpy.context.mode != "OBJECT":
+        return 0.2
+    scene = bpy.context.scene
+    body = projection_body()
+    if body is None or not scene.get("vp_auto", True):
+        return 0.2
+    signature = (scene.as_pointer(), tuple(value for row in body.matrix_world for value in row),
+                 body.get("power", 1.0), scene.get("vp_content"),
+                 tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_scatter", "vp_show_image", "vp_show_layers")),
+                 tuple(tuple(o.matrix_world.translation) for o in scene.objects if o.get("vp_role") == "bubble"))
+    runtime = getattr(bpy, "_volume_projection_runtime", {})
+    if signature != runtime.get("signature"):
+        try:
+            update_projection()
+            runtime["signature"] = signature
+        except Exception as exc:
+            scene["vp_auto"] = False
+            log_step(f"自动更新暂停: {exc}")
+    return 0.15
+
+
+class VP_OT_update(bpy.types.Operator):
+    bl_idname = "vp.update"
+    bl_label = "更新投影"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        update_projection()
+        return {"FINISHED"}
+
+
+class VP_OT_restore(bpy.types.Operator):
+    bl_idname = "vp.restore"
+    bl_label = "恢复标定位置"
+    bl_options = {"REGISTER", "UNDO"}
+
+    def execute(self, context):
+        restore_calibration()
+        return {"FINISHED"}
+
+
+class VP_OT_content(bpy.types.Operator):
+    bl_idname = "vp.content"
+    bl_label = "投影内容"
+    bl_options = {"REGISTER", "UNDO"}
+    mode: bpy.props.EnumProperty(items=[("TEST", "测试图", ""), ("WHITE", "全白", ""), ("DEPTH", "深度编码", "")])
+
+    def execute(self, context):
+        context.scene["vp_content"] = self.mode
+        update_projection()
+        return {"FINISHED"}
+
+
+class VP_OT_export(bpy.types.Operator):
+    bl_idname = "vp.export"
+    bl_label = "导出坐标和投影图"
+
+    def execute(self, context):
+        try:
+            export_projection()
+        except OSError as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, str(OUTPUT_DIR))
+        return {"FINISHED"}
+
+
+class VP_PT_controls(bpy.types.Panel):
+    bl_label = "体积投影"
+    bl_idname = "VP_PT_controls"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "体积投影"
+
+    @classmethod
+    def poll(cls, context):
+        return projection_body() is not None
+
+    def draw(self, context):
+        layout = self.layout
+        scene = context.scene
+        body = projection_body()
+        layout.prop(body, "location", text="位置")
+        layout.prop(body, "rotation_euler", text="旋转")
+        layout.prop(body, '["power"]', text="相对强度")
+        layout.prop(scene, '["vp_auto"]', text="自动更新")
+        layout.operator_menu_enum("vp.content", "mode", text={"TEST": "测试图", "WHITE": "全白", "DEPTH": "深度编码"}.get(scene.get("vp_content"), "投影内容"))
+        layout.label(text=f"照亮 {scene.get('vp_lit_count', 0)} / {scene.get('vp_total_count', 0)}")
+        for key, label in (("vp_show_rays", "像素光线"), ("vp_show_scatter", "散射示意"),
+                           ("vp_show_image", "参考图像平面"), ("vp_show_layers", "深度层")):
+            layout.prop(scene, f'["{key}"]', text=label)
+        layout.operator("vp.update", icon="FILE_REFRESH")
+        layout.operator("vp.restore", icon="LOOP_BACK")
+        layout.operator("vp.export", icon="EXPORT")
+
+
+def register_projection_controls():
+    runtime = getattr(bpy, "_volume_projection_runtime", {})
+    callback = runtime.get("timer")
+    if callback and bpy.app.timers.is_registered(callback):
+        bpy.app.timers.unregister(callback)
+    for cls in reversed(runtime.get("classes", [])):
+        bpy.utils.unregister_class(cls)
+    classes = (VP_OT_update, VP_OT_restore, VP_OT_content, VP_OT_export, VP_PT_controls)
+    for cls in classes:
+        bpy.utils.register_class(cls)
+    bpy._volume_projection_runtime = {"timer": live_projection_tick, "classes": classes}
+    if not bpy.app.background:
+        bpy.app.timers.register(live_projection_tick, first_interval=0.15, persistent=True)
+
+
 def select_projector_for_manual_adjustment(scene_data: Dict[str, object]) -> None:
-    projector = scene_data.get("projector")
-    projector_obj = getattr(projector, "object", None)
+    projector_obj = projection_body()
     if projector_obj is None:
         return
 
@@ -973,8 +1301,8 @@ def select_projector_for_manual_adjustment(scene_data: Dict[str, object]) -> Non
     bpy.context.view_layer.objects.active = projector_obj
 
     projector_obj["manual_adjustment_note"] = (
-        "Move this Projector_Body object to adjust the projector location. "
-        "Run the script again after large moves to regenerate ray-aligned bubble paths."
+        "Move or rotate this body. Fixed scatterers are resampled by a pinhole projector. "
+        "Restore the calibrated pose in the Volume Projection sidebar. No refraction model."
     )
 
     if bpy.app.background:
@@ -997,7 +1325,10 @@ def select_projector_for_manual_adjustment(scene_data: Dict[str, object]) -> Non
         }
         try:
             with bpy.context.temp_override(**override):
-                bpy.ops.view3d.view_selected(use_all_regions=False)
+                space.region_3d.view_perspective = "CAMERA"
+                space.region_3d.view_camera_zoom = 0
+                space.shading.type = "MATERIAL"
+                space.show_region_ui = True
         except Exception:
             pass
         break
@@ -1012,6 +1343,7 @@ def get_script_args() -> List[str]:
 
 def render_preview(output_path: Path = PREVIEW_IMAGE_PATH) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    update_projection()
 
     scene = bpy.context.scene
     scene.render.resolution_x = 1280
@@ -1028,7 +1360,13 @@ def render_preview(output_path: Path = PREVIEW_IMAGE_PATH) -> Path:
 def save_blend_file(output_path: Path = PREVIEW_BLEND_PATH) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     log_step(f"保存 Blender 场景文件: {output_path}")
-    bpy.ops.wm.save_as_mainfile(filepath=str(output_path))
+    wm = bpy.context.window_manager
+    running = wm.get(RUNNING_FLAG_KEY, False)
+    wm[RUNNING_FLAG_KEY] = False
+    try:
+        bpy.ops.wm.save_as_mainfile(filepath=str(output_path))
+    finally:
+        wm[RUNNING_FLAG_KEY] = running
     return output_path
 
 
@@ -1041,9 +1379,17 @@ def main() -> None:
     args = get_script_args()
     window_manager[RUNNING_FLAG_KEY] = True
     try:
-        scene_data = build_scene()
+        if bpy.context.scene.get("vp_version") == SCENE_VERSION and projection_body() and "--rebuild" not in args:
+            scene_data = {}
+            log_step("保留已有场景和投影仪位置，重新连接投影控制。")
+            update_projection()
+        else:
+            scene_data = build_scene()
+        register_projection_controls()
         if "--keep-open" in args:
             select_projector_for_manual_adjustment(scene_data)
+        if "--export-data" in args:
+            export_projection()
         if "--render-preview" in args:
             render_preview()
         if "--save-blend" in args:

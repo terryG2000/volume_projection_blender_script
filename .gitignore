@@ -1,2 +1,6 @@
 __pycache__/
 *.pyc
+tmp/
+outputs/*.blend
+outputs/*.blend1
+outputs/*.log

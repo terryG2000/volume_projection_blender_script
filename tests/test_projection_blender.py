@@ -1,0 +1,149 @@
+"""Run with Blender --background --factory-startup --python-exit-code 1 --python this_file."""
+import importlib.util
+import csv
+import math
+from pathlib import Path
+import sys
+import unittest
+
+import bpy
+from mathutils import Vector
+
+ROOT = Path(__file__).resolve().parents[1]
+spec = importlib.util.spec_from_file_location("projection_under_test", ROOT / "projector.py")
+projection = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(projection)
+
+
+class ProjectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.data = projection.build_scene()
+        bpy.context.view_layer.update()
+
+    def test_parent_preserves_newly_assigned_scale(self):
+        fin = bpy.data.objects["Projector_CoolingFin_00"]
+        self.assertAlmostEqual(fin.matrix_world.to_scale().x, 0.045, places=5)
+
+    def test_dark_pixels_still_have_physical_scatterers(self):
+        self.assertEqual(len(self.data["bubble_field"].bubbles),
+                         projection.IMAGE_GRID_X * projection.IMAGE_GRID_Z)
+
+    def test_lens_tracks_body_transform(self):
+        projector = self.data["projector"]
+        before = projector.lens_position.copy()
+        body = projector.object
+        old = body.location.copy()
+        try:
+            body.location.x += 0.3
+            bpy.context.view_layer.update()
+            self.assertAlmostEqual(projector.lens_position.x - before.x, 0.3, places=5)
+        finally:
+            body.location = old
+            bpy.context.view_layer.update()
+
+    def test_live_projection_keeps_bubbles_fixed_and_turns_away(self):
+        self.assertTrue(hasattr(projection, "update_projection"), "Live projection is missing")
+        body = self.data["projector"].object
+        bubbles = self.data["bubble_field"].bubbles
+        positions = [tuple(b.matrix_world.translation) for b in bubbles]
+        old = body.rotation_euler.copy()
+        try:
+            body.rotation_euler.z += math.pi
+            bpy.context.view_layer.update()
+            projection.update_projection()
+            self.assertEqual(bpy.context.scene["vp_lit_count"], 0)
+            self.assertEqual(positions, [tuple(b.matrix_world.translation) for b in bubbles])
+        finally:
+            body.rotation_euler = old
+            bpy.context.view_layer.update()
+            projection.update_projection()
+
+    def test_calibrated_ray_mapping(self):
+        self.assertTrue(hasattr(projection, "project_to_pixel"), "Inverse projection is missing")
+        body = self.data["projector"].object
+        for bubble in self.data["bubble_field"].bubbles:
+            sample = projection.project_to_pixel(body, bubble.matrix_world.translation)
+            self.assertIsNotNone(sample)
+            self.assertAlmostEqual(sample[0], bubble["pixel_x"], places=4)
+            self.assertAlmostEqual(sample[1], bubble["pixel_z"], places=4)
+
+    def test_pixel_rays_do_not_intersect_other_bubbles(self):
+        lens = self.data["projector"].lens_position
+        bubbles = self.data["bubble_field"].bubbles
+        volume = self.data["volume"]
+        for bubble in bubbles:
+            position = bubble.matrix_world.translation
+            radius = max(bubble.scale)
+            self.assertLess(abs(position.x - volume.center.x) + radius, volume.size.x / 2)
+            self.assertLess(abs(position.y - volume.center.y) + radius, volume.size.y / 2)
+            self.assertLess(abs(position.z - volume.center.z) + radius, volume.size.z / 2)
+            direction = (position - lens).normalized()
+            for other in bubbles:
+                if other != bubble:
+                    distance = (other.matrix_world.translation - lens).cross(direction).length
+                    self.assertGreater(distance, max(other.scale))
+
+    def test_reference_image_updates_with_content(self):
+        scene = bpy.context.scene
+        images = [o for o in scene.objects if o.get("vp_role") == "image"]
+        self.assertEqual(len(images), projection.IMAGE_GRID_X * projection.IMAGE_GRID_Z)
+        try:
+            scene["vp_content"] = "WHITE"
+            projection.update_projection()
+            self.assertEqual(scene["vp_lit_count"], scene["vp_total_count"])
+            self.assertTrue(all(min(o.color[:3]) > 0.99 for o in images))
+        finally:
+            scene["vp_content"] = "TEST"
+            projection.update_projection()
+
+    def test_export_contains_fixed_and_dark_points(self):
+        out = ROOT / "tmp" / "test_export"
+        projection.export_projection(out)
+        with (out / "bubble_coordinates.csv").open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertEqual(len(rows), projection.IMAGE_GRID_X * projection.IMAGE_GRID_Z)
+        self.assertTrue(any(row["lit"] == "0" for row in rows))
+        self.assertTrue((out / "projector_input.png").is_file())
+
+    def test_rerun_preserves_user_edits_and_registration(self):
+        body = self.data["projector"].object
+        old = body.location.copy()
+        marker = bpy.data.objects.new("User_Note", None)
+        bpy.context.scene.collection.objects.link(marker)
+        try:
+            body.location.x += 0.2
+            bpy.context.view_layer.update()
+            count = len(bpy.context.scene.objects)
+            projection.main()
+            projection.main()
+            self.assertEqual(len(bpy.context.scene.objects), count)
+            self.assertAlmostEqual(body.location.x, old.x + 0.2, places=5)
+            self.assertIn(marker.name, bpy.context.scene.objects)
+            self.assertEqual(len(bpy._volume_projection_runtime["classes"]), 5)
+        finally:
+            body.location = old
+            bpy.data.objects.remove(marker, do_unlink=True)
+            bpy.context.view_layer.update()
+            projection.update_projection()
+
+    def test_turn_off_and_restore(self):
+        body = self.data["projector"].object
+        original = body.matrix_world.copy()
+        body["power"] = 0.0
+        projection.update_projection()
+        self.assertEqual(bpy.context.scene["vp_lit_count"], 0)
+        body["power"] = 1.0
+        body.location.x += 0.5
+        body.rotation_euler.z += 0.2
+        projection.restore_calibration()
+        bpy.context.view_layer.update()
+        for row1, row2 in zip(body.matrix_world, original):
+            for a, b in zip(row1, row2):
+                self.assertAlmostEqual(a, b, places=5)
+
+
+if __name__ == "__main__":
+    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(ProjectionTests))
+    if not result.wasSuccessful():
+        raise RuntimeError("Projection regression tests failed")
