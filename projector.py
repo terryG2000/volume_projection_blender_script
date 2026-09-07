@@ -888,11 +888,11 @@ def setup_scene(camera_target: Vector) -> Vector:
     glint.data.energy = 80
     glint.data.color = (0.72, 0.88, 1.0)
 
-    bpy.ops.object.camera_add(location=(-5.6, 3.4, 3.05))
+    bpy.ops.object.camera_add(location=(-6.4, -0.4, 3.8))
     camera = bpy.context.object
     camera.name = "Camera_Overview"
-    camera.data.lens = 28
-    look_at(camera, camera_target)
+    camera.data.lens = 36
+    look_at(camera, Vector((camera_target.x, -1.1, 1.65)))
     scene.camera = camera
 
     return Vector(camera.location)
@@ -1360,6 +1360,11 @@ def render_preview(output_path: Path = PREVIEW_IMAGE_PATH) -> Path:
 def save_blend_file(output_path: Path = PREVIEW_BLEND_PATH) -> Path:
     output_path.parent.mkdir(parents=True, exist_ok=True)
     log_step(f"保存 Blender 场景文件: {output_path}")
+    text = bpy.data.texts.get("VolumeProjection_Controls.py") or bpy.data.texts.new("VolumeProjection_Controls.py")
+    text.clear()
+    text.write(Path(__file__).read_text(encoding="utf-8"))
+    text.filepath = str(Path(__file__).resolve())
+    text.use_module = False
     wm = bpy.context.window_manager
     running = wm.get(RUNNING_FLAG_KEY, False)
     wm[RUNNING_FLAG_KEY] = False
