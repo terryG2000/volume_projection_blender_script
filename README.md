@@ -3,6 +3,20 @@
 普通透视投影仪照射玻璃中的散射点，默认按当前投影仪姿态动态设计点云。当前版本在 Blender 5.2.1 LTS 验证。
 默认建立独立的 `VolumeProjection` 场景，保留原场景；重复运行会重新连接控制并保留手动修改。
 
+## 项目文件
+
+- `projector.py`：唯一的模型运行入口，包含建模、材质、光线映射和侧栏控制；不依赖本地 `classes` 或 `utils` 包。
+- `tests/test_projection_blender.py`：Blender 回归测试。
+- `README.md`、`CHANGELOG.md`、`AGENTS.md`：使用说明、变更历史和维护约定。
+- `Nayar_TR06.pdf`：参考论文，保留原文件。
+- `outputs/`：可编辑场景、预览及导出数据，保留已有结果。
+- `tmp/`、`__pycache__/`：验证临时文件和 Python 缓存，不作为运行入口，不纳入 Git。
+
+旧版根目录 `__init__.py`、`classes/` 和 `utils/` 中的 7 个代码文件已移出工作目录，
+因为当前入口和测试均不引用这些模块。原始内容保存在 Git 提交 `167f7cb` 中。
+可用 `git show 167f7cb:classes/projector.py` 查看旧实现，不必恢复到当前目录。
+本项目通过 Blender 执行独立脚本，不再提供旧版包导入入口。
+
 ## 运行与调整
 
 在项目目录的 PowerShell 中运行：
