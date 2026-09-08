@@ -143,7 +143,67 @@ class ProjectionTests(unittest.TestCase):
                 self.assertAlmostEqual(a, b, places=5)
 
 
+class ParametricTests(unittest.TestCase):
+    def setUp(self):
+        projection.build_scene()
+        self.scene = bpy.context.scene
+        self.body = projection.projection_body()
+
+    def bubbles(self):
+        return [o for o in self.scene.objects if o.get("vp_role") == "bubble"]
+
+    def test_density_rebuilds_without_resetting_pose_or_user_objects(self):
+        self.body.location.x += 0.15
+        bpy.context.view_layer.update()
+        pose = self.body.matrix_world.copy()
+        marker = bpy.data.objects.new("User_Control", None)
+        self.scene.collection.objects.link(marker)
+        self.scene["vp_samples_x"] = 24
+        self.scene["vp_samples_z"] = 18
+        projection.update_projection()
+        self.assertEqual(len(self.bubbles()), 432)
+        self.assertEqual(list(self.body["vp_grid"]), [24, 18])
+        self.assertEqual(pose, self.body.matrix_world)
+        self.assertIn(marker.name, self.scene.objects)
+
+    def test_fov_is_actual_full_angular_field(self):
+        self.scene["vp_fov_x"] = 60.0
+        self.scene["vp_fov_z"] = 45.0
+        projection.update_projection()
+        nx, nz = self.body["vp_grid"]
+        plane = Vector(self.body["vp_plane_origin"])
+        sx, sz = self.body["vp_plane_span"]
+        lens = self.body.matrix_world @ Vector(self.body["vp_lens_local"])
+        center = plane + Vector((sx / 2, 0, sz / 2))
+        left = self.body.matrix_world @ (center - Vector((sx * nx / (nx - 1) / 2, 0, 0)))
+        right = self.body.matrix_world @ (center + Vector((sx * nx / (nx - 1) / 2, 0, 0)))
+        self.assertAlmostEqual(math.degrees((left - lens).angle(right - lens)), 60.0, places=3)
+        self.assertGreater(len(self.bubbles()), 0)
+        for point in self.bubbles():
+            sample = projection.project_to_pixel(self.body, point.matrix_world.translation)
+            self.assertAlmostEqual(sample[0], point["pixel_x"], places=3)
+            self.assertAlmostEqual(sample[1], point["pixel_z"], places=3)
+
+    def test_fov_can_keep_existing_scatterers_fixed(self):
+        before = {b.name: tuple(b.matrix_world.translation) for b in self.bubbles()}
+        span = tuple(self.body["vp_plane_span"])
+        self.scene["vp_freeze_points"] = True
+        self.scene["vp_fov_x"] = 75.0
+        projection.update_projection()
+        self.assertEqual(before, {b.name: tuple(b.matrix_world.translation) for b in self.bubbles()})
+        self.assertNotEqual(span, tuple(self.body["vp_plane_span"]))
+
+    def test_rebuild_while_aiming_away_creates_no_outside_points(self):
+        self.body.rotation_euler.z = math.pi
+        self.scene["vp_samples_x"] = 20
+        projection.update_projection()
+        self.assertEqual(len(self.bubbles()), 0)
+        self.assertEqual(self.scene["vp_lit_count"], 0)
+
+
 if __name__ == "__main__":
-    result = unittest.TextTestRunner(verbosity=2).run(unittest.defaultTestLoader.loadTestsFromTestCase(ProjectionTests))
+    suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(ProjectionTests),
+                                unittest.defaultTestLoader.loadTestsFromTestCase(ParametricTests)])
+    result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not result.wasSuccessful():
         raise RuntimeError("Projection regression tests failed")

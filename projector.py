@@ -14,6 +14,8 @@ GUI 保留窗口运行示例：
 import math
 import csv
 import random
+import json
+import time
 import sys
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
@@ -43,6 +45,7 @@ BUBBLE_RADIUS = 0.027
 BUBBLE_PATH_RAY_LIMIT = 160 if FAST_PREVIEW else 260
 SCENE_VERSION = 2
 DEPTH_SEED = 2006
+MODEL_KEYS = ("vp_fov_x", "vp_fov_z", "vp_samples_x", "vp_samples_z", "vp_layers", "vp_radius", "vp_freeze_points")
 
 RAY_GRID_X = 6 if FAST_PREVIEW else 13
 RAY_GRID_Z = 4 if FAST_PREVIEW else 9
@@ -988,6 +991,9 @@ def build_scene() -> Dict[str, object]:
             obj["vp_generated"] = True
     initialize_projection(projector, volume)
     update_projection()
+    bubble_field.bubbles = [o for o in scene.objects if o.get("vp_role") == "bubble"]
+    bubble_field.active_bubbles = [o for o in bubble_field.bubbles if o.get("vp_lit")]
+    bubble_field.pattern_pixels = [o for o in scene.objects if o.get("vp_role") == "image"]
 
     print("=" * 72)
     print("体积投影仿真场景创建完成")
@@ -1029,6 +1035,7 @@ def initialize_projection(projector, volume):
     body.id_properties_ui("power").update(min=0.0, max=5.0)
     scene["vp_version"] = SCENE_VERSION
     scene["vp_body"] = body.name
+    scene["vp_volume"] = volume.object.name
     scene["vp_content"] = "TEST"
     scene["vp_auto"] = True
     scene["vp_show_rays"] = True
@@ -1042,6 +1049,209 @@ def initialize_projection(projector, volume):
             obj["vp_vertices_local"] = [value for vertex in obj.data.vertices for value in (inverse @ vertex.co)]
         if obj.get("vp_role") == "bubble":
             obj["vp_design_position"] = list(obj.matrix_world.translation)
+    ensure_model_parameters(reset=True)
+
+
+def ensure_model_parameters(reset=False):
+    scene = bpy.context.scene
+    body = projection_body()
+    nx, nz = body["vp_grid"]
+    scale = body.matrix_world.to_scale()
+    distance = abs(body["vp_plane_origin"][1] - body["vp_lens_local"][1]) * scale.y
+    sx, sz = body["vp_plane_span"]
+    defaults = {
+        "vp_fov_x": math.degrees(2 * math.atan(sx * scale.x * nx / (nx - 1) / (2 * distance))),
+        "vp_fov_z": math.degrees(2 * math.atan(sz * scale.z * nz / (nz - 1) / (2 * distance))),
+        "vp_samples_x": nx, "vp_samples_z": nz, "vp_layers": BUBBLE_DEPTH_LAYERS,
+        "vp_radius": BUBBLE_RADIUS, "vp_freeze_points": False,
+    }
+    limits = {"vp_fov_x": (5.0, 140.0), "vp_fov_z": (5.0, 140.0),
+              "vp_samples_x": (2, 64), "vp_samples_z": (2, 64), "vp_layers": (1, 32),
+              "vp_radius": (0.001, 0.08)}
+    for key, value in defaults.items():
+        if reset or key not in scene:
+            scene[key] = value
+            if key in limits:
+                low, high = limits[key]
+                scene.id_properties_ui(key).update(min=low, max=high)
+    roles = {role: next((o for o in scene.objects if o.get("vp_role") == role), None)
+             for role in ("bubble", "image", "beam", "scatter")}
+    for role in ("bubble", "image"):
+        obj = roles[role]
+        if obj:
+            scene[f"vp_{role}_mesh"] = obj.data.name
+            scene[f"vp_{role}_collection"] = obj.users_collection[0].name
+    for role in ("beam", "scatter"):
+        obj = roles[role]
+        if obj:
+            scene[f"vp_{role}_material"] = obj.data.materials[0].name
+    # Use the colored ray material rather than the old coarse black guide.
+    ray = next((o for o in scene.objects if o.get("vp_role") == "beam" and not o.get("vp_coarse")), None)
+    if ray:
+        scene["vp_beam_material"] = ray.data.materials[0].name
+        scene["vp_rays_collection"] = ray.users_collection[0].name
+    if not scene.get("vp_volume"):
+        volume = next(o for o in scene.objects if o.name.startswith("Transparent_Glass_Cube") and o.type == "MESH")
+        scene["vp_volume"] = volume.name
+    if reset:
+        scene["vp_model_applied"] = ""
+
+
+def pixel_target_local(body, ix, iz):
+    nx, nz = body["vp_grid"]
+    origin = Vector(body["vp_plane_origin"])
+    sx, sz = body["vp_plane_span"]
+    return origin + Vector((sx * ix / (nx - 1), 0.0, sz * iz / (nz - 1)))
+
+
+def ray_volume_interval(lens, direction, volume, margin):
+    """Slab intersection in the glass object's local unit cube, t in world meters."""
+    inverse = volume.matrix_world.inverted()
+    origin = inverse @ lens
+    ray = inverse.to_3x3() @ direction
+    scale = volume.matrix_world.to_scale()
+    near, far = 0.0, float("inf")
+    for axis in range(3):
+        extent = 0.5 - margin / abs(scale[axis])
+        if extent <= 0:
+            return None
+        if abs(ray[axis]) < 1e-10:
+            if abs(origin[axis]) > extent:
+                return None
+            continue
+        a = (-extent - origin[axis]) / ray[axis]
+        b = (extent - origin[axis]) / ray[axis]
+        near, far = max(near, min(a, b)), min(far, max(a, b))
+        if near >= far:
+            return None
+    return near, far
+
+
+def rebuild_point_cloud():
+    scene = bpy.context.scene
+    body = projection_body()
+    world = body.matrix_world.copy()
+    lens = world @ Vector(body["vp_lens_local"])
+    volume = scene.objects[scene["vp_volume"]]
+    mesh_bubble = bpy.data.meshes[scene["vp_bubble_mesh"]]
+    mesh_image = bpy.data.meshes[scene["vp_image_mesh"]]
+    bubbles_collection = bpy.data.collections[scene["vp_bubble_collection"]]
+    image_collection = bpy.data.collections[scene["vp_image_collection"]]
+    rays_collection = bpy.data.collections[scene["vp_rays_collection"]]
+    beam_material = bpy.data.materials[scene["vp_beam_material"]]
+    scatter_material = bpy.data.materials[scene["vp_scatter_material"]]
+    nx, nz = body["vp_grid"]
+    layers = int(scene["vp_layers"])
+    radius_limit = float(scene["vp_radius"])
+    old_curves = []
+    for obj in list(scene.objects):
+        if obj.get("vp_generated") and (obj.get("vp_role") in {"bubble", "image", "beam", "scatter", "frustum", "writing"}
+                                         or obj.name.startswith("Bubble_Depth_Layer_")):
+            if obj.type == "CURVE":
+                old_curves.append(obj.data)
+            bpy.data.objects.remove(obj, do_unlink=True)
+    for curve in old_curves:
+        if curve.users == 0:
+            bpy.data.curves.remove(curve)
+    span_x, span_z = body["vp_plane_span"]
+    scale = world.to_scale()
+    distance = abs(body["vp_plane_origin"][1] - body["vp_lens_local"][1]) * scale.y
+    pixel_w, pixel_h = span_x * scale.x / (nx - 1), span_z * scale.z / (nz - 1)
+    ray_stride = max(1, math.ceil(nx * nz / BUBBLE_PATH_RAY_LIMIT))
+    points = []
+    for iz in range(nz):
+        for ix in range(nx):
+            local_target = pixel_target_local(body, ix, iz)
+            target = world @ local_target
+            direction = (target - lens).normalized()
+            image = bpy.data.objects.new(f"Projected_Image_Pixel_{ix:02d}_{iz:02d}", mesh_image)
+            image_collection.objects.link(image)
+            image.scale = (pixel_w * 0.46, 0.004, pixel_h * 0.46)
+            image["vp_role"] = "image"
+            image["vp_target_local"] = list(local_target)
+            image["pixel_x"], image["pixel_z"] = ix, iz
+            image["vp_generated"] = True
+            if (iz * nx + ix) % ray_stride == 0:
+                beam = create_curve(f"RayAligned_Bubble_Path_{ix:02d}_{iz:02d}", (lens, target), beam_material, 0.0016, rays_collection)
+                beam["vp_role"] = "beam"
+                beam["vp_target_local"] = list(local_target)
+                beam["pixel_x"], beam["pixel_z"] = ix, iz
+                beam["vp_generated"] = True
+            interval = ray_volume_interval(lens, direction, volume, radius_limit)
+            if interval is None:
+                continue
+            group, slot = divmod(ix, layers)
+            permutation = list(range(layers))
+            random.Random(DEPTH_SEED + iz * 1009 + group * 9176).shuffle(permutation)
+            fraction = (permutation[slot] + 0.5 + (stable_hash(ix, iz, 4) - 0.5) * 0.5) / layers
+            near, far = interval
+            travel = near + fraction * (far - near)
+            position = lens + direction * travel
+            angular_pitch = min(pixel_w, pixel_h) * distance / (target - lens).length_squared
+            radius = min(radius_limit, 0.20 * travel * angular_pitch)
+            bubble = bpy.data.objects.new(f"BubblePixel_{ix:02d}_{iz:02d}", mesh_bubble)
+            bubbles_collection.objects.link(bubble)
+            bubble.location = position
+            bubble.scale = (radius,) * 3
+            bubble["vp_role"] = "bubble"
+            bubble["vp_generated"] = True
+            bubble["pixel_x"], bubble["pixel_z"] = ix, iz
+            bubble["depth_fraction"] = fraction
+            bubble["vp_design_position"] = list(position)
+            points.append(bubble)
+    for index, bubble in enumerate(points[::max(1, math.ceil(len(points) / SCATTER_SAMPLE_LIMIT))]):
+        start = bubble.location
+        direction = (scene.camera.matrix_world.translation - start).normalized()
+        scatter = create_curve(f"Bubble_Scatter_ToCamera_{index:03d}", (start, start + direction * 0.45), scatter_material, 0.003, rays_collection)
+        scatter["vp_role"] = "scatter"
+        scatter["vp_bubble"] = bubble.name
+        scatter["vp_generated"] = True
+    for layer in range(1, layers):
+        y = 0.5 - layer / layers
+        coords = [volume.matrix_world @ Vector((x, y, z)) for x, z in ((-.5, -.5), (.5, -.5), (.5, .5), (-.5, .5), (-.5, -.5))]
+        guide = create_curve(f"Bubble_Depth_Layer_{layer:02d}", coords, beam_material, 0.001, rays_collection)
+        guide["vp_generated"] = True
+    body["vp_calibration_matrix"] = [v for row in world for v in row]
+    scene["vp_density"] = len(points) / abs(volume.matrix_world.determinant())
+    bpy.context.view_layer.update()
+    log_step(f"参数化点云: {nx} x {nz}, {len(points)} 个点位于玻璃内部。")
+
+
+def apply_model_parameters():
+    scene = bpy.context.scene
+    body = projection_body()
+    if any(key not in scene for key in MODEL_KEYS):
+        ensure_model_parameters()
+    for key in ("vp_samples_x", "vp_samples_z"):
+        scene[key] = max(2, min(64, int(scene[key])))
+    scene["vp_layers"] = max(1, min(32, int(scene["vp_layers"])))
+    for key in ("vp_fov_x", "vp_fov_z"):
+        scene[key] = clamp(float(scene[key]), 5.0, 140.0)
+    scene["vp_radius"] = clamp(float(scene["vp_radius"]), 0.001, 0.08)
+    signature = json.dumps([scene[key] for key in MODEL_KEYS])
+    if signature == scene.get("vp_model_applied"):
+        return
+    geometry = json.dumps([scene[key] for key in MODEL_KEYS[2:6]])
+    nx, nz = scene["vp_samples_x"], scene["vp_samples_z"]
+    body["vp_grid"] = [nx, nz]
+    scale = body.matrix_world.to_scale()
+    lens = Vector(body["vp_lens_local"])
+    y = body["vp_plane_origin"][1]
+    distance = abs(y - lens.y) * abs(scale.y)
+    sx = 2 * distance * math.tan(math.radians(scene["vp_fov_x"]) / 2) / abs(scale.x) * (nx - 1) / nx
+    sz = 2 * distance * math.tan(math.radians(scene["vp_fov_z"]) / 2) / abs(scale.z) * (nz - 1) / nz
+    body["vp_plane_span"] = [sx, sz]
+    body["vp_plane_origin"] = [lens.x - sx / 2, y, lens.z - sz / 2]
+    if not scene["vp_freeze_points"] or geometry != scene.get("vp_geometry_applied"):
+        rebuild_point_cloud()
+    else:
+        for obj in scene.objects:
+            if obj.get("vp_role") in {"beam", "image"} and "pixel_x" in obj:
+                obj["vp_target_local"] = list(pixel_target_local(body, obj["pixel_x"], obj["pixel_z"]))
+                if obj.get("vp_role") == "image":
+                    obj.scale = (sx * abs(scale.x) / (nx - 1) * 0.46, 0.004, sz * abs(scale.z) / (nz - 1) * 0.46)
+    scene["vp_geometry_applied"] = geometry
+    scene["vp_model_applied"] = signature
 
 
 def project_to_pixel(body, world_position):
@@ -1096,6 +1306,7 @@ def update_projection():
     if body is None or "vp_lens_local" not in body:
         return
     bpy.context.view_layer.update()
+    apply_model_parameters()
     world = body.matrix_world
     lens = world @ Vector(body["vp_lens_local"])
     frame = projection_frame(scene, body)
@@ -1186,11 +1397,19 @@ def live_projection_tick():
     body = projection_body()
     if body is None or not scene.get("vp_auto", True):
         return 0.2
+    runtime = getattr(bpy, "_volume_projection_runtime", {})
+    parameters = (scene.as_pointer(),) + tuple(scene.get(key) for key in MODEL_KEYS)
+    if parameters != runtime.get("pending_parameters"):
+        runtime["pending_parameters"] = parameters
+        runtime["parameters_changed_at"] = time.monotonic()
+        return 0.1
+    if time.monotonic() - runtime.get("parameters_changed_at", 0) < 0.35:
+        return 0.1
     signature = (scene.as_pointer(), tuple(value for row in body.matrix_world for value in row),
+                 parameters,
                  body.get("power", 1.0), scene.get("vp_content"),
                  tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_scatter", "vp_show_image", "vp_show_layers")),
                  tuple(tuple(o.matrix_world.translation) for o in scene.objects if o.get("vp_role") == "bubble"))
-    runtime = getattr(bpy, "_volume_projection_runtime", {})
     if signature != runtime.get("signature"):
         try:
             update_projection()
@@ -1264,6 +1483,16 @@ class VP_PT_controls(bpy.types.Panel):
         body = projection_body()
         layout.prop(body, "location", text="位置")
         layout.prop(body, "rotation_euler", text="旋转")
+        layout.separator()
+        layout.prop(scene, '["vp_fov_x"]', text="水平 FOV (°)")
+        layout.prop(scene, '["vp_fov_z"]', text="垂直 FOV (°)")
+        layout.prop(scene, '["vp_samples_x"]', text="横向点数")
+        layout.prop(scene, '["vp_samples_z"]', text="纵向点数")
+        layout.prop(scene, '["vp_layers"]', text="深度层数")
+        layout.prop(scene, '["vp_radius"]', text="半径上限 (m)")
+        layout.prop(scene, '["vp_freeze_points"]', text="变焦时固定气泡")
+        layout.label(text=f"实际密度 {scene.get('vp_density', 0):.1f} 点/m³")
+        layout.separator()
         layout.prop(body, '["power"]', text="相对强度")
         layout.prop(scene, '["vp_auto"]', text="自动更新")
         layout.operator_menu_enum("vp.content", "mode", text={"TEST": "测试图", "WHITE": "全白", "DEPTH": "深度编码"}.get(scene.get("vp_content"), "投影内容"))
