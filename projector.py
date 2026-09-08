@@ -1228,7 +1228,11 @@ def apply_model_parameters():
     for key in ("vp_fov_x", "vp_fov_z"):
         scene[key] = clamp(float(scene[key]), 5.0, 140.0)
     scene["vp_radius"] = clamp(float(scene["vp_radius"]), 0.001, 0.08)
-    signature = json.dumps([scene[key] for key in MODEL_KEYS])
+    # Rebuild in design mode when the projector pose changes; fixed-glass mode
+    # only resamples illumination and keeps the manufactured point positions.
+    pose = [value for row in body.matrix_world for value in row]
+    signature = json.dumps([scene[key] for key in MODEL_KEYS] +
+                           [pose if not scene["vp_freeze_points"] else None])
     if signature == scene.get("vp_model_applied"):
         return
     geometry = json.dumps([scene[key] for key in MODEL_KEYS[2:6]])
@@ -1398,7 +1402,8 @@ def live_projection_tick():
     if body is None or not scene.get("vp_auto", True):
         return 0.2
     runtime = getattr(bpy, "_volume_projection_runtime", {})
-    parameters = (scene.as_pointer(),) + tuple(scene.get(key) for key in MODEL_KEYS)
+    pose = tuple(value for row in body.matrix_world for value in row)
+    parameters = (scene.as_pointer(), pose) + tuple(scene.get(key) for key in MODEL_KEYS)
     if parameters != runtime.get("pending_parameters"):
         runtime["pending_parameters"] = parameters
         runtime["parameters_changed_at"] = time.monotonic()
@@ -1490,7 +1495,7 @@ class VP_PT_controls(bpy.types.Panel):
         layout.prop(scene, '["vp_samples_z"]', text="纵向点数")
         layout.prop(scene, '["vp_layers"]', text="深度层数")
         layout.prop(scene, '["vp_radius"]', text="半径上限 (m)")
-        layout.prop(scene, '["vp_freeze_points"]', text="变焦时固定气泡")
+        layout.prop(scene, '["vp_freeze_points"]', text="固定气泡位置")
         layout.label(text=f"实际密度 {scene.get('vp_density', 0):.1f} 点/m³")
         layout.separator()
         layout.prop(body, '["power"]', text="相对强度")
@@ -1530,8 +1535,9 @@ def select_projector_for_manual_adjustment(scene_data: Dict[str, object]) -> Non
     bpy.context.view_layer.objects.active = projector_obj
 
     projector_obj["manual_adjustment_note"] = (
-        "Move or rotate this body. Fixed scatterers are resampled by a pinhole projector. "
-        "Restore the calibrated pose in the Volume Projection sidebar. No refraction model."
+        "Move or rotate this body to regenerate ray-aligned points after a short pause. "
+        "Enable fixed points in the Volume Projection sidebar for illumination-only updates. "
+        "No refraction model."
     )
 
     if bpy.app.background:

@@ -5,6 +5,7 @@ import math
 from pathlib import Path
 import sys
 import unittest
+from unittest.mock import patch
 
 import bpy
 from mathutils import Vector
@@ -19,6 +20,8 @@ class ProjectionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         cls.data = projection.build_scene()
+        bpy.context.scene["vp_freeze_points"] = True
+        projection.update_projection()
         bpy.context.view_layer.update()
 
     def test_parent_preserves_newly_assigned_scale(self):
@@ -199,6 +202,67 @@ class ParametricTests(unittest.TestCase):
         projection.update_projection()
         self.assertEqual(len(self.bubbles()), 0)
         self.assertEqual(self.scene["vp_lit_count"], 0)
+
+    def test_pose_change_rebuilds_points_on_new_rays(self):
+        before = {b.name: tuple(b.location) for b in self.bubbles()}
+        self.body.location.x += 0.4
+        self.body.rotation_euler.z += 0.12
+        projection.update_projection()
+        self.assertNotEqual(before, {b.name: tuple(b.location) for b in self.bubbles()})
+        self.assertGreater(len(self.bubbles()), 0)
+        volume = self.scene.objects[self.scene["vp_volume"]]
+        lens = self.body.matrix_world @ Vector(self.body["vp_lens_local"])
+        for point in self.bubbles():
+            position = point.matrix_world.translation
+            sample = projection.project_to_pixel(self.body, position)
+            self.assertAlmostEqual(sample[0], point["pixel_x"], places=3)
+            self.assertAlmostEqual(sample[1], point["pixel_z"], places=3)
+            local = volume.matrix_world.inverted() @ position
+            self.assertTrue(all(abs(value) < 0.5 for value in local))
+            target = self.body.matrix_world @ projection.pixel_target_local(
+                self.body, point["pixel_x"], point["pixel_z"])
+            self.assertLess((position - lens).cross((target - lens).normalized()).length, 1e-5)
+        pointers = [b.as_pointer() for b in self.bubbles()]
+        projection.update_projection()
+        self.assertEqual(pointers, [b.as_pointer() for b in self.bubbles()])
+
+    def test_pose_away_and_back_removes_and_restores_points(self):
+        before = {b.name: tuple(b.location) for b in self.bubbles()}
+        self.body.rotation_euler.z = math.pi
+        projection.update_projection()
+        self.assertEqual(len(self.bubbles()), 0)
+        self.body.rotation_euler.z = 0
+        projection.update_projection()
+        self.assertEqual(before, {b.name: tuple(b.location) for b in self.bubbles()})
+
+    def test_timer_debounces_pose_and_respects_auto_switch(self):
+        projection.register_projection_controls()
+        before = {b.name: tuple(b.location) for b in self.bubbles()}
+        with patch.object(projection.time, "monotonic", return_value=10.0):
+            projection.live_projection_tick()
+        self.body.location.x += 0.4
+        bpy.context.view_layer.update()
+        with patch.object(projection.time, "monotonic", return_value=11.0):
+            projection.live_projection_tick()
+        with patch.object(projection.time, "monotonic", return_value=11.2):
+            projection.live_projection_tick()
+        self.assertEqual(before, {b.name: tuple(b.location) for b in self.bubbles()})
+        self.scene["vp_auto"] = False
+        with patch.object(projection.time, "monotonic", return_value=12.0):
+            projection.live_projection_tick()
+        self.assertEqual(before, {b.name: tuple(b.location) for b in self.bubbles()})
+        self.scene["vp_auto"] = True
+        with patch.object(projection.time, "monotonic", return_value=13.0):
+            projection.live_projection_tick()
+        self.assertNotEqual(before, {b.name: tuple(b.location) for b in self.bubbles()})
+
+    def test_fixed_mode_keeps_points_after_pose_and_fov_change(self):
+        before = {b.name: tuple(b.location) for b in self.bubbles()}
+        self.scene["vp_freeze_points"] = True
+        self.body.location.x += 0.4
+        self.scene["vp_fov_x"] = 60.0
+        projection.update_projection()
+        self.assertEqual(before, {b.name: tuple(b.location) for b in self.bubbles()})
 
 
 if __name__ == "__main__":
