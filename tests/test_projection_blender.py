@@ -345,6 +345,36 @@ class OpticalTests(unittest.TestCase):
             if obj.get("vp_role") == "bubble":
                 self.assertEqual(tuple(obj.color[:3]), (0, 0, 0))
 
+    def test_volume_has_no_specular_reflection_but_lens_is_unchanged(self):
+        volume = self.scene.objects[self.scene["vp_volume"]]
+        nodes = volume.data.materials[0].node_tree.nodes
+        glass = next(n for n in nodes if n.type == "BSDF_REFRACTION")
+        self.assertFalse(any(n.type == "BSDF_PRINCIPLED" for n in nodes))
+        self.assertAlmostEqual(glass.inputs["IOR"].default_value, 1.46)
+        self.assertFalse(volume.hide_render)
+        lens = bpy.data.materials["Mat_Projector_Lens_Glass"]
+        lens_shader = next(n for n in lens.node_tree.nodes if n.type == "BSDF_PRINCIPLED")
+        self.assertEqual(lens_shader.inputs["Specular IOR Level"].default_value, 0.5)
+
+    def test_rerun_removes_old_glass_reflection_without_resetting_experiment(self):
+        volume = self.scene.objects[self.scene["vp_volume"]]
+        self.scene["vp_freeze_points"] = True
+        self.body.location.x += 0.1
+        projection.update_projection()
+        legacy = projection.create_glass_material("Legacy_Volume_Glass", (0.72, 0.92, 1, 1), 0.27)
+        volume.data.materials[0] = legacy
+        points = [(o.name, tuple(o.location), tuple(o.color)) for o in self.scene.objects if o.get("vp_role") == "bubble"]
+        lights = [(o.name, o.data.energy) for o in self.scene.objects if o.type == "LIGHT"]
+        pose = self.body.matrix_world.copy()
+        projection.main()
+        nodes = volume.data.materials[0].node_tree.nodes
+        self.assertFalse(any(n.type == "BSDF_PRINCIPLED" for n in nodes))
+        mix = next(n for n in nodes if n.type == "MIX_SHADER")
+        self.assertAlmostEqual(mix.inputs[0].default_value, 0.27)
+        self.assertEqual(pose, self.body.matrix_world)
+        self.assertEqual(points, [(o.name, tuple(o.location), tuple(o.color)) for o in self.scene.objects if o.get("vp_role") == "bubble"])
+        self.assertEqual(lights, [(o.name, o.data.energy) for o in self.scene.objects if o.type == "LIGHT"])
+
     def test_off_center_point_samples_original_image_on_current_ray(self):
         image = bpy.data.images.new("Fine_Color_Stripes", width=4, height=2, float_buffer=True)
         image.pixels = [1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1] * 2

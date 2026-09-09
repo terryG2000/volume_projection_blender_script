@@ -223,6 +223,38 @@ def create_emission_material(
     return mat
 
 
+def remove_volume_reflections(volume):
+    """Replace the glass surface with transmission only, including legacy scenes."""
+    for index, material in enumerate(volume.data.materials):
+        if not material or not material.use_nodes:
+            continue
+        if not any(n.type == "BSDF_PRINCIPLED" for n in material.node_tree.nodes):
+            continue
+        if material.users > 1:
+            material = material.copy()
+            volume.data.materials[index] = material
+        nodes, links = material.node_tree.nodes, material.node_tree.links
+        for bsdf in [n for n in nodes if n.type == "BSDF_PRINCIPLED"]:
+            refraction = nodes.new("ShaderNodeBsdfRefraction")
+            transparent = nodes.new("ShaderNodeBsdfTransparent")
+            mix = nodes.new("ShaderNodeMixShader")
+            # Retain authored transparency, tint, and refraction inputs, including links.
+            for source, target in ((bsdf.inputs["Base Color"], refraction.inputs["Color"]),
+                                   (bsdf.inputs["Roughness"], refraction.inputs["Roughness"]),
+                                   (bsdf.inputs["IOR"], refraction.inputs["IOR"]),
+                                   (bsdf.inputs["Alpha"], mix.inputs[0])):
+                target.default_value = source.default_value
+                if source.is_linked:
+                    links.new(source.links[0].from_socket, target)
+            if bsdf.inputs["Normal"].is_linked:
+                links.new(bsdf.inputs["Normal"].links[0].from_socket, refraction.inputs["Normal"])
+            links.new(transparent.outputs[0], mix.inputs[1])
+            links.new(refraction.outputs[0], mix.inputs[2])
+            for link in list(bsdf.outputs["BSDF"].links):
+                links.new(mix.outputs[0], link.to_socket)
+            nodes.remove(bsdf)
+
+
 def create_object_color_emission_material(name: str, strength: float = 1.8) -> bpy.types.Material:
     """使用对象颜色驱动材质，方便大量气泡/像素共用同一份网格。"""
     mat = bpy.data.materials.new(name=name)
@@ -1436,6 +1468,7 @@ def update_optical_projection(frame):
     # Glass is a visual envelope only in this straight-ray approximation.
     volume = scene.objects[scene["vp_volume"]]
     volume.visible_shadow = False
+    remove_volume_reflections(volume)
     for obj in scene.objects:
         if obj.get("vp_generated") and obj.name.startswith("Projector_Lens"):
             obj.visible_shadow = False
