@@ -1456,8 +1456,7 @@ def update_optical_projection(frame):
             light["vp_generated"], light["vp_role"], light["vp_bubble"] = True, "scatter_light", name
         light.location = bubble.matrix_world.translation
         light.data.shadow_soft_size = max(bubble.scale)
-        sample = project_to_pixel(body, light.location)
-        color = frame.get(tuple(math.floor(v + 0.5) for v in sample), (0, 0, 0, 1)) if sample else (0, 0, 0, 1)
+        color = tuple(bubble["vp_incident_color"])
         distance = max((light.location - lens).length, 0.01)
         pixel_area = 4 * distance * distance * tan_x * tan_z / (nx * nz)
         intercepted = min(1.0, math.pi * max(bubble.scale) ** 2 / max(pixel_area, 1e-9))
@@ -1480,23 +1479,43 @@ def update_optical_projection(frame):
     bpy.context.view_layer.update()
 
 
-def projection_frame(scene, body):
+def projection_image_data(scene):
+    source = bpy.data.images.get(scene.get("vp_source_image", "")) if scene.get("vp_content") == "IMAGE" else None
+    if source and source.size[0] > 0 and source.size[1] > 0:
+        return source.size[0], source.size[1], list(source.pixels)
+    return None
+
+
+def sample_projection_color(body, sample, frame, image_data):
+    if sample is None:
+        return (0.0, 0.0, 0.0, 1.0)
+    if image_data is not None:
+        width, height, pixels = image_data
+        nx, nz = body["vp_grid"]
+        # Convert the continuous ray coordinate to UV before sampling the original
+        # image, matching the spotlight's Closest filter without grid quantization.
+        x = max(0, min(width - 1, math.floor((sample[0] + 0.5) / nx * width)))
+        y = max(0, min(height - 1, math.floor((sample[1] + 0.5) / nz * height)))
+        offset = (y * width + x) * 4
+        rgba = pixels[offset:offset + 4]
+        return tuple(c * rgba[3] for c in rgba[:3]) + (1.0,)
+    return frame.get(tuple(math.floor(v + 0.5) for v in sample), (0.0, 0.0, 0.0, 1.0))
+
+
+def projection_frame(scene, body, image_data=None):
     nx, nz = body["vp_grid"]
     mode = scene.get("vp_content", "TEST")
-    source = bpy.data.images.get(scene.get("vp_source_image", "")) if mode == "IMAGE" else None
-    pixels = list(source.pixels) if source else None
+    image_data = image_data if image_data is not None else projection_image_data(scene)
     depths = {(obj["pixel_x"], obj["pixel_z"]): obj["depth_fraction"]
               for obj in scene.objects if obj.get("vp_role") == "bubble"}
     frame = {}
     for ix in range(nx):
         for iz in range(nz):
-            if pixels:
-                width, height = source.size
-                x = min(width - 1, int((ix + 0.5) / nx * width))
-                y = min(height - 1, int((iz + 0.5) / nz * height))
-                offset = (y * width + x) * 4
-                rgba = pixels[offset:offset + 4]
-                color = tuple(c * rgba[3] for c in rgba[:3]) + (1.0,)
+            if image_data is not None:
+                color = sample_projection_color(body, (ix, iz), frame, image_data)
+            elif mode == "COLOR_BARS":
+                colors = ((1, 0, 0), (0, 1, 0), (0, 0, 1), (0, 1, 1), (1, 0, 1), (1, 1, 0))
+                color = colors[min(5, ix * 6 // nx)] + (1.0,)
             elif mode == "WHITE":
                 color = (1.0, 1.0, 1.0, 1.0)
             elif mode == "DEPTH":
@@ -1523,14 +1542,16 @@ def update_projection():
     apply_model_parameters()
     world = body.matrix_world
     lens = world @ Vector(body["vp_lens_local"])
-    frame = projection_frame(scene, body)
+    image_data = projection_image_data(scene)
+    frame = projection_frame(scene, body, image_data)
     lit_count = 0
     power = max(0.0, float(body.get("power", 1.0)))
     for obj in scene.objects:
         role = obj.get("vp_role")
         if role == "bubble":
             sample = project_to_pixel(body, obj.matrix_world.translation)
-            color = frame.get(tuple(math.floor(v + 0.5) for v in sample), (0, 0, 0, 1)) if sample else (0, 0, 0, 1)
+            color = sample_projection_color(body, sample, frame, image_data)
+            obj["vp_incident_color"] = color
             obj.color = tuple(channel * power for channel in color[:3]) + (1.0,)
             obj["vp_lit"] = power > 0 and max(color[:3]) > 0.001
             lit_count += int(obj["vp_lit"])
@@ -1594,12 +1615,14 @@ def export_projection(output_dir=OUTPUT_DIR):
     with (output_dir / "bubble_coordinates.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.writer(stream)
         writer.writerow(("name", "pixel_x_calibrated", "pixel_z_calibrated", "depth_fraction",
-                         "x_m", "y_m", "z_m", "pixel_x_current", "pixel_z_current", "lit", "scattered_w_approx"))
+                         "x_m", "y_m", "z_m", "pixel_x_current", "pixel_z_current", "lit", "scattered_w_approx",
+                         "incident_r", "incident_g", "incident_b"))
         for bubble in sorted((o for o in scene.objects if o.get("vp_role") == "bubble"), key=lambda o: (o["pixel_x"], o["pixel_z"])):
             position = bubble.matrix_world.translation
             sample = project_to_pixel(body, position) or ("", "")
             writer.writerow((bubble.name, bubble["pixel_x"], bubble["pixel_z"], bubble["depth_fraction"],
-                             *position, *sample, int(bubble["vp_lit"]), bubble.get("vp_scattered_w", 0.0)))
+                             *position, *sample, int(bubble["vp_lit"]), bubble.get("vp_scattered_w", 0.0),
+                             *list(bubble["vp_incident_color"])[:3]))
     nx, nz = body["vp_grid"]
     frame = projection_frame(scene, body)
     image = bpy.data.images.new("Projection_Input_Export", width=nx, height=nz, alpha=True)
@@ -1676,7 +1699,7 @@ class VP_OT_content(bpy.types.Operator):
     bl_idname = "vp.content"
     bl_label = "投影内容"
     bl_options = {"REGISTER", "UNDO"}
-    mode: bpy.props.EnumProperty(items=[("TEST", "测试图", ""), ("WHITE", "全白", ""), ("DEPTH", "深度编码", ""), ("IMAGE", "图片", "")])
+    mode: bpy.props.EnumProperty(items=[("TEST", "测试图", ""), ("COLOR_BARS", "彩条", ""), ("WHITE", "全白", ""), ("DEPTH", "深度编码", ""), ("IMAGE", "图片", "")])
 
     def execute(self, context):
         if self.mode == "IMAGE" and bpy.data.images.get(context.scene.get("vp_source_image", "")) is None:
@@ -1749,7 +1772,7 @@ class VP_PT_controls(bpy.types.Panel):
         layout.separator()
         layout.prop(body, '["power"]', text="相对强度")
         layout.prop(scene, '["vp_auto"]', text="自动更新")
-        layout.operator_menu_enum("vp.content", "mode", text={"TEST": "测试图", "WHITE": "全白", "DEPTH": "深度编码", "IMAGE": "图片"}.get(scene.get("vp_content"), "投影内容"))
+        layout.operator_menu_enum("vp.content", "mode", text={"TEST": "测试图", "COLOR_BARS": "彩条", "WHITE": "全白", "DEPTH": "深度编码", "IMAGE": "图片"}.get(scene.get("vp_content"), "投影内容"))
         layout.operator("vp.load_image", icon="IMAGE_DATA")
         if scene.get("vp_source_image"):
             layout.label(text=scene["vp_source_image"], icon="IMAGE_DATA")

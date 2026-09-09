@@ -15,7 +15,7 @@
     "vp_show_receiver": true,
     "vp_source_image": ""
   },
-  "content": "TEST",
+  "content": "COLOR_BARS",
   "power": 1.0,
   "projector_matrix_world": [
     [
@@ -43,6 +43,6 @@
       1.0
     ]
   ],
-  "source_sha256": "647249458c3391ace307d5018fd950e5be4d6062280dbf9d5d77689a09652726",
+  "source_sha256": "5c9d4e218f4b9538bf9b00a5a860099897551624790c49525a2e6c40964761bf",
   "limitations": "No refraction, incident occlusion, multiple scattering, or primary-beam depletion."
 }

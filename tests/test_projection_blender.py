@@ -345,6 +345,47 @@ class OpticalTests(unittest.TestCase):
             if obj.get("vp_role") == "bubble":
                 self.assertEqual(tuple(obj.color[:3]), (0, 0, 0))
 
+    def test_off_center_point_samples_original_image_on_current_ray(self):
+        image = bpy.data.images.new("Fine_Color_Stripes", width=4, height=2, float_buffer=True)
+        image.pixels = [1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 0, 1] * 2
+        self.scene["vp_source_image"] = image.name
+        self.scene["vp_content"] = "IMAGE"
+        self.scene["vp_samples_x"] = self.scene["vp_samples_z"] = 2
+        self.scene["vp_scatter_albedo"] = 1.0
+        projection.update_projection()
+        self.scene["vp_freeze_points"] = True
+        bubble = next(o for o in self.scene.objects if o.get("vp_role") == "bubble" and o["pixel_x"] == 0)
+        lens = self.body.matrix_world @ Vector(self.body["vp_lens_local"])
+        target = self.body.matrix_world @ projection.pixel_target_local(self.body, -0.3, 0)
+        bubble.location = lens.lerp(target, 0.65)
+        projection.update_projection()
+        # u=0.1 is red in the original 4-column image; the coarse cell center is green.
+        self.assertEqual(tuple(bubble.color[:3]), (1, 0, 0))
+        secondary = next(o for o in self.scene.objects if o.get("vp_role") == "scatter_light" and o["vp_bubble"] == bubble.name)
+        self.assertEqual(tuple(secondary.data.color), (1, 0, 0))
+        # Moving the projector shifts this fixed point into a different original-image column.
+        self.body.location.x -= 0.6
+        projection.update_projection()
+        self.assertEqual(tuple(bubble.color[:3]), (0, 1, 0))
+        self.assertEqual(tuple(secondary.data.color), (0, 1, 0))
+        self.body.rotation_euler.z = math.pi
+        projection.update_projection()
+        self.assertEqual(tuple(bubble.color[:3]), (0, 0, 0))
+        self.assertEqual(secondary.data.energy, 0)
+
+    def test_color_bars_give_ray_and_point_the_same_hue(self):
+        self.scene["vp_content"] = "COLOR_BARS"
+        self.scene["vp_show_rays"] = True
+        self.scene["vp_scatter_albedo"] = 1.0
+        projection.update_projection()
+        bubbles = [o for o in self.scene.objects if o.get("vp_role") == "bubble"]
+        self.assertGreaterEqual(len({tuple(o.color[:3]) for o in bubbles}), 6)
+        first = next(o for o in bubbles if o["pixel_x"] == 0)
+        self.assertEqual(tuple(first.color[:3]), (1, 0, 0))
+        for beam in (o for o in self.scene.objects if o.get("vp_role") == "beam"):
+            bubble = next(o for o in bubbles if o["pixel_x"] == beam["pixel_x"] and o["pixel_z"] == beam["pixel_z"])
+            self.assertEqual(tuple(beam.color[:3]), tuple(bubble.color[:3]))
+
 
 if __name__ == "__main__":
     suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(ProjectionTests),
