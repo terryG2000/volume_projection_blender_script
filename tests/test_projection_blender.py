@@ -123,7 +123,7 @@ class ProjectionTests(unittest.TestCase):
             self.assertEqual(len(bpy.context.scene.objects), count)
             self.assertAlmostEqual(body.location.x, old.x + 0.2, places=5)
             self.assertIn(marker.name, bpy.context.scene.objects)
-            self.assertEqual(len(bpy._volume_projection_runtime["classes"]), 5)
+            self.assertEqual(len(bpy._volume_projection_runtime["classes"]), 6)
         finally:
             body.location = old
             bpy.data.objects.remove(marker, do_unlink=True)
@@ -265,9 +265,91 @@ class ParametricTests(unittest.TestCase):
         self.assertEqual(before, {b.name: tuple(b.location) for b in self.bubbles()})
 
 
+class OpticalTests(unittest.TestCase):
+    def setUp(self):
+        projection.build_scene()
+        self.scene = bpy.context.scene
+        self.body = projection.projection_body()
+
+    def test_textured_spot_tracks_lens_and_power(self):
+        self.assertTrue(hasattr(projection, "update_optical_projection"))
+        spot = self.scene.objects[self.scene["vp_spot"]]
+        self.assertEqual(spot.data.type, "SPOT")
+        self.assertIsNotNone(spot.data.node_tree.nodes.get("ProjectionImage").image)
+        self.body.location.x += 0.25
+        self.body.rotation_euler.z += 0.1
+        projection.update_projection()
+        lens = self.body.matrix_world @ Vector(self.body["vp_lens_local"])
+        self.assertLess((spot.location - lens).length, 1e-5)
+        forward = self.body.matrix_world.to_quaternion() @ Vector((0, -1, 0))
+        self.assertLess(((spot.rotation_quaternion @ Vector((0, 0, -1))) - forward).length, 1e-5)
+        self.body["power"] = 0
+        projection.update_projection()
+        self.assertEqual(spot.data.energy, 0)
+        self.assertTrue(all(o.data.energy == 0 for o in self.scene.objects if o.get("vp_role") == "scatter_light"))
+
+    def test_image_sampling_matches_pixel_centers(self):
+        image = bpy.data.images.new("Test_Quadrants", width=2, height=2, float_buffer=True)
+        image.pixels = [1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1]
+        self.scene["vp_source_image"] = image.name
+        self.scene["vp_content"] = "IMAGE"
+        self.scene["vp_samples_x"] = 2
+        self.scene["vp_samples_z"] = 2
+        projection.update_projection()
+        frame = projection.projection_frame(self.scene, self.body)
+        self.assertEqual(frame[0, 0], (1, 0, 0, 1))
+        self.assertEqual(frame[1, 0], (0, 1, 0, 1))
+        self.assertEqual(frame[0, 1], (0, 0, 1, 1))
+        self.assertEqual(frame[1, 1], (1, 1, 1, 1))
+
+    def test_each_bubble_has_secondary_source_with_bounded_flux(self):
+        bubbles = [o for o in self.scene.objects if o.get("vp_role") == "bubble"]
+        lights = [o for o in self.scene.objects if o.get("vp_role") == "scatter_light"]
+        self.assertEqual(len(lights), len(bubbles))
+        for light in lights:
+            bubble = self.scene.objects[light["vp_bubble"]]
+            self.assertLess((light.location - bubble.location).length, 1e-5)
+            self.assertEqual(light.data.energy > 0, bool(bubble["vp_lit"]))
+        self.assertLess(sum(light.data.energy for light in lights), self.scene["vp_flux_w"])
+        self.scene["vp_scatter_albedo"] = 0
+        projection.update_projection()
+        self.assertTrue(all(light.data.energy == 0 for light in lights))
+
+    def test_receiver_is_fixed_and_non_emissive(self):
+        self.assertIn("vp_receiver", self.scene)
+        receiver = self.scene.objects[self.scene["vp_receiver"]]
+        pose = receiver.matrix_world.copy()
+        self.body.location.x += 0.25
+        projection.update_projection()
+        self.assertEqual(pose, receiver.matrix_world)
+        self.assertFalse(any(node.type == "EMISSION" for node in receiver.data.materials[0].node_tree.nodes))
+        self.scene["vp_optics"] = False
+        projection.update_projection()
+        self.assertEqual(self.scene.objects[self.scene["vp_spot"]].data.energy, 0)
+
+    def test_load_image_packs_source_and_invalid_path_preserves_it(self):
+        out = ROOT / "tmp" / "image_load"
+        projection.export_projection(out)
+        projection.load_projection_image(str(out / "projector_input.png"))
+        name = self.scene["vp_source_image"]
+        self.assertEqual(self.scene["vp_content"], "IMAGE")
+        self.assertIsNotNone(bpy.data.images[name].packed_file)
+        with self.assertRaises(ValueError):
+            projection.load_projection_image(str(out / "does_not_exist.png"))
+        self.assertEqual(name, self.scene["vp_source_image"])
+
+    def test_zero_source_power_darks_scatter_markers(self):
+        self.scene["vp_flux_w"] = 0.0
+        projection.update_projection()
+        for obj in self.scene.objects:
+            if obj.get("vp_role") == "bubble":
+                self.assertEqual(tuple(obj.color[:3]), (0, 0, 0))
+
+
 if __name__ == "__main__":
     suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(ProjectionTests),
-                                unittest.defaultTestLoader.loadTestsFromTestCase(ParametricTests)])
+                                unittest.defaultTestLoader.loadTestsFromTestCase(ParametricTests),
+                                unittest.defaultTestLoader.loadTestsFromTestCase(OpticalTests)])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not result.wasSuccessful():
         raise RuntimeError("Projection regression tests failed")

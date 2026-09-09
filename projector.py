@@ -15,6 +15,7 @@ import math
 import csv
 import random
 import json
+import hashlib
 import time
 import sys
 from pathlib import Path
@@ -46,6 +47,7 @@ BUBBLE_PATH_RAY_LIMIT = 160 if FAST_PREVIEW else 260
 SCENE_VERSION = 2
 DEPTH_SEED = 2006
 MODEL_KEYS = ("vp_fov_x", "vp_fov_z", "vp_samples_x", "vp_samples_z", "vp_layers", "vp_radius", "vp_freeze_points")
+OPTICAL_KEYS = ("vp_optics", "vp_flux_w", "vp_scatter_albedo", "vp_show_receiver", "vp_source_image")
 
 RAY_GRID_X = 6 if FAST_PREVIEW else 13
 RAY_GRID_Z = 4 if FAST_PREVIEW else 9
@@ -137,7 +139,10 @@ def scene_clear() -> None:
     log_step("清理旧场景...")
     for obj in list(bpy.context.scene.objects):
         if obj.get("vp_generated"):
+            light = obj.data if obj.type == "LIGHT" else None
             bpy.data.objects.remove(obj, do_unlink=True)
+            if light is not None and light.users == 0:
+                bpy.data.lights.remove(light)
 
     for mesh in list(bpy.data.meshes):
         if mesh.users == 0:
@@ -856,7 +861,7 @@ def setup_scene(camera_target: Vector) -> Vector:
     scene.render.resolution_x = 1800
     scene.render.resolution_y = 1100
 
-    for engine in ("BLENDER_EEVEE_NEXT", "BLENDER_EEVEE", "CYCLES"):
+    for engine in ("CYCLES", "BLENDER_EEVEE_NEXT", "BLENDER_EEVEE"):
         try:
             scene.render.engine = engine
             break
@@ -864,7 +869,8 @@ def setup_scene(camera_target: Vector) -> Vector:
             continue
 
     if scene.render.engine == "CYCLES" and hasattr(scene, "cycles"):
-        scene.cycles.samples = 96
+        scene.cycles.samples = 32
+        scene.cycles.preview_samples = 12
         scene.cycles.use_denoising = True
 
     try:
@@ -878,24 +884,26 @@ def setup_scene(camera_target: Vector) -> Vector:
     world = scene.world or bpy.data.worlds.new("World")
     scene.world = world
     world.color = (0.03, 0.035, 0.04)
+    world.use_nodes = True
+    world.node_tree.nodes.get("Background").inputs["Strength"].default_value = 0.025
 
     bpy.ops.object.light_add(type="AREA", location=(-2.8, 1.8, 5.2))
     key = bpy.context.object
     key.name = "Large_Softbox_Key_Light"
-    key.data.energy = 360
+    key.data.energy = 100
     key.data.size = 5.0
 
     bpy.ops.object.light_add(type="POINT", location=(1.3, -3.0, 2.4))
     glint = bpy.context.object
     glint.name = "Glass_Glint_Light"
-    glint.data.energy = 80
+    glint.data.energy = 3
     glint.data.color = (0.72, 0.88, 1.0)
 
-    bpy.ops.object.camera_add(location=(-6.4, -0.4, 3.8))
+    bpy.ops.object.camera_add(location=(-7.6, 0.3, 4.2))
     camera = bpy.context.object
     camera.name = "Camera_Overview"
-    camera.data.lens = 36
-    look_at(camera, Vector((camera_target.x, -1.1, 1.65)))
+    camera.data.lens = 32
+    look_at(camera, Vector((camera_target.x, -1.5, 1.65)))
     scene.camera = camera
 
     return Vector(camera.location)
@@ -1038,8 +1046,8 @@ def initialize_projection(projector, volume):
     scene["vp_volume"] = volume.object.name
     scene["vp_content"] = "TEST"
     scene["vp_auto"] = True
-    scene["vp_show_rays"] = True
-    scene["vp_show_scatter"] = False
+    scene["vp_show_rays"] = False
+    scene["vp_show_scatter"] = True
     scene["vp_show_image"] = False
     scene["vp_show_layers"] = False
     for obj in scene.objects:
@@ -1050,6 +1058,7 @@ def initialize_projection(projector, volume):
         if obj.get("vp_role") == "bubble":
             obj["vp_design_position"] = list(obj.matrix_world.translation)
     ensure_model_parameters(reset=True)
+    ensure_optical_settings(reset=True)
 
 
 def ensure_model_parameters(reset=False):
@@ -1201,11 +1210,12 @@ def rebuild_point_cloud():
             points.append(bubble)
     for index, bubble in enumerate(points[::max(1, math.ceil(len(points) / SCATTER_SAMPLE_LIMIT))]):
         start = bubble.location
-        direction = (scene.camera.matrix_world.translation - start).normalized()
-        scatter = create_curve(f"Bubble_Scatter_ToCamera_{index:03d}", (start, start + direction * 0.45), scatter_material, 0.003, rays_collection)
-        scatter["vp_role"] = "scatter"
-        scatter["vp_bubble"] = bubble.name
-        scatter["vp_generated"] = True
+        for axis, direction in enumerate(((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))):
+            scatter = create_curve(f"Bubble_Scatter_{index:03d}_{axis}", (start, start + Vector(direction) * 0.18), scatter_material, 0.0016, rays_collection)
+            scatter["vp_role"] = "scatter"
+            scatter["vp_bubble"] = bubble.name
+            scatter["vp_direction"] = direction
+            scatter["vp_generated"] = True
     for layer in range(1, layers):
         y = 0.5 - layer / layers
         coords = [volume.matrix_world @ Vector((x, y, z)) for x, z in ((-.5, -.5), (.5, -.5), (.5, .5), (-.5, .5), (-.5, -.5))]
@@ -1279,15 +1289,215 @@ def project_to_pixel(body, world_position):
     return ix, iz
 
 
+def ensure_optical_settings(reset=False):
+    scene = bpy.context.scene
+    defaults = {"vp_optics": True, "vp_flux_w": 180.0, "vp_scatter_albedo": 0.65,
+                "vp_show_receiver": True, "vp_source_image": ""}
+    for key, value in defaults.items():
+        if reset or key not in scene:
+            scene[key] = value
+    scene["vp_flux_w"] = max(0.0, float(scene["vp_flux_w"]))
+    scene["vp_scatter_albedo"] = clamp(float(scene["vp_scatter_albedo"]), 0.0, 1.0)
+    scene.id_properties_ui("vp_flux_w").update(min=0.0, max=5000.0)
+    scene.id_properties_ui("vp_scatter_albedo").update(min=0.0, max=1.0)
+
+
+def load_projection_image(filepath):
+    path = Path(bpy.path.abspath(filepath)).resolve()
+    if not path.is_file():
+        raise ValueError(f"图像文件不存在: {path}")
+    image = bpy.data.images.load(str(path), check_existing=False)
+    if image.size[0] == 0 or image.size[1] == 0:
+        bpy.data.images.remove(image)
+        raise ValueError("无法读取图像像素")
+    image.pack()
+    bpy.context.scene["vp_source_image"] = image.name
+    bpy.context.scene["vp_content"] = "IMAGE"
+    update_projection()
+
+
+def camera_only_material(name, strength):
+    """Markers are visible to the camera but do not add light or occlude the rig."""
+    mat = bpy.data.materials.new(name)
+    mat.use_nodes = True
+    nodes, links = mat.node_tree.nodes, mat.node_tree.links
+    nodes.clear()
+    info = nodes.new("ShaderNodeObjectInfo")
+    emission = nodes.new("ShaderNodeEmission")
+    emission.inputs["Strength"].default_value = strength
+    transparent = nodes.new("ShaderNodeBsdfTransparent")
+    path = nodes.new("ShaderNodeLightPath")
+    mix = nodes.new("ShaderNodeMixShader")
+    output = nodes.new("ShaderNodeOutputMaterial")
+    links.new(info.outputs["Color"], emission.inputs["Color"])
+    links.new(path.outputs["Is Camera Ray"], mix.inputs[0])
+    links.new(transparent.outputs[0], mix.inputs[1])
+    links.new(emission.outputs[0], mix.inputs[2])
+    links.new(mix.outputs[0], output.inputs["Surface"])
+    return mat
+
+
+def create_optical_rig():
+    scene = bpy.context.scene
+    collection = ensure_collection("07_Optical_Simulation")
+    light = bpy.data.lights.new("Projector_Image_Light", "SPOT")
+    light.use_nodes = True
+    light.shadow_soft_size = 0.0
+    light.spot_blend = 0.0
+    spot = bpy.data.objects.new("Projector_Image_Light", light)
+    collection.objects.link(spot)
+    spot["vp_generated"], spot["vp_role"] = True, "projector_light"
+    spot.rotation_mode = "QUATERNION"
+    nodes, links = light.node_tree.nodes, light.node_tree.links
+    nodes.clear()
+    coords = nodes.new("ShaderNodeTexCoord")
+    separate = nodes.new("ShaderNodeSeparateXYZ")
+    links.new(coords.outputs["Normal"], separate.inputs[0])
+    absolute = nodes.new("ShaderNodeMath")
+    absolute.operation = "ABSOLUTE"
+    links.new(separate.outputs["Z"], absolute.inputs[0])
+    combine = nodes.new("ShaderNodeCombineXYZ")
+    for axis in ("X", "Y"):
+        divide = nodes.new("ShaderNodeMath")
+        divide.operation = "DIVIDE"
+        links.new(separate.outputs[axis], divide.inputs[0])
+        links.new(absolute.outputs[0], divide.inputs[1])
+        scale = nodes.new("ShaderNodeMath")
+        scale.operation = "MULTIPLY_ADD"
+        scale.name = f"FOV_{axis}"
+        scale.inputs[2].default_value = 0.5
+        links.new(divide.outputs[0], scale.inputs[0])
+        links.new(scale.outputs[0], combine.inputs[axis])
+    texture = nodes.new("ShaderNodeTexImage")
+    texture.name = "ProjectionImage"
+    texture.extension = "CLIP"
+    texture.interpolation = "Closest"
+    links.new(combine.outputs[0], texture.inputs["Vector"])
+    emission = nodes.new("ShaderNodeEmission")
+    emission.inputs["Strength"].default_value = 1.0
+    alpha = nodes.new("ShaderNodeVectorMath")
+    alpha.operation = "SCALE"
+    links.new(texture.outputs["Color"], alpha.inputs[0])
+    links.new(texture.outputs["Alpha"], alpha.inputs["Scale"])
+    links.new(alpha.outputs[0], emission.inputs["Color"])
+    output = nodes.new("ShaderNodeOutputLight")
+    links.new(emission.outputs[0], output.inputs["Surface"])
+    volume = scene.objects[scene["vp_volume"]]
+    receiver = add_cube("Projection_Receiver", (volume.location.x, volume.location.y - volume.dimensions.y / 2 - 0.6, volume.location.z),
+                        (4.0, 0.06, 2.8), create_simple_material("Mat_Receiver_Matte", (0.8, 0.8, 0.8, 1), 1.0), collection)
+    receiver["vp_generated"], receiver["vp_role"] = True, "receiver"
+    scene["vp_spot"], scene["vp_receiver"] = spot.name, receiver.name
+    scene["vp_optical_collection"] = collection.name
+    scene["vp_optical_marker_material"] = camera_only_material("Mat_Optical_Markers", 2.0).name
+    scene["vp_optical_ray_material"] = camera_only_material("Mat_Colored_Optical_Rays", 1.0).name
+
+
+def update_optical_projection(frame):
+    scene = bpy.context.scene
+    ensure_optical_settings()
+    if scene.objects.get(scene.get("vp_spot", "")) is None:
+        create_optical_rig()
+    body = projection_body()
+    spot = scene.objects[scene["vp_spot"]]
+    receiver = scene.objects.get(scene.get("vp_receiver", ""))
+    collection = bpy.data.collections[scene["vp_optical_collection"]]
+    enabled = bool(scene["vp_optics"])
+    if enabled and scene.render.engine != "CYCLES":
+        scene.render.engine = "CYCLES"
+    power = max(0.0, float(body.get("power", 1)))
+    flux = max(0.0, float(scene["vp_flux_w"])) * power if enabled else 0.0
+    albedo = clamp(float(scene["vp_scatter_albedo"]), 0, 1)
+    lens = body.matrix_world @ Vector(body["vp_lens_local"])
+    rotation = body.matrix_world.to_quaternion()
+    spot.location = lens
+    # Preserve projector roll as well as its optical axis.
+    spot.rotation_quaternion = rotation @ Vector((0, -1, 0)).to_track_quat("-Z", "Y")
+    tan_x = math.tan(math.radians(scene["vp_fov_x"]) / 2)
+    tan_z = math.tan(math.radians(scene["vp_fov_z"]) / 2)
+    spot.data.spot_size = min(math.pi, 2 * math.atan(math.hypot(tan_x, tan_z)) + 0.01)
+    spot.data.energy = flux
+    nodes = spot.data.node_tree.nodes
+    nodes["FOV_X"].inputs[1].default_value = 1 / (2 * tan_x)
+    nodes["FOV_Y"].inputs[1].default_value = 1 / (2 * tan_z)
+    nx, nz = body["vp_grid"]
+    source = bpy.data.images.get(scene.get("vp_source_image", "")) if scene.get("vp_content") == "IMAGE" else None
+    if source is None:
+        source = bpy.data.images.get(scene.get("vp_frame_image", ""))
+        if source is None:
+            source = bpy.data.images.new("Projection_Frame", width=nx, height=nz, float_buffer=True)
+            scene["vp_frame_image"] = source.name
+        if tuple(source.size) != (nx, nz):
+            source.scale(nx, nz)
+        source.pixels = [c for iz in range(nz) for ix in range(nx) for c in frame[ix, iz]]
+        source.update()
+    nodes["ProjectionImage"].image = source
+    if receiver:
+        set_visibility(receiver, scene["vp_show_receiver"])
+    # Glass is a visual envelope only in this straight-ray approximation.
+    volume = scene.objects[scene["vp_volume"]]
+    volume.visible_shadow = False
+    for obj in scene.objects:
+        if obj.get("vp_generated") and obj.name.startswith("Projector_Lens"):
+            obj.visible_shadow = False
+    bubbles = {o.name: o for o in scene.objects if o.get("vp_role") == "bubble"}
+    sources = {o.get("vp_bubble"): o for o in scene.objects if o.get("vp_role") == "scatter_light"}
+    for name, light in list(sources.items()):
+        if name not in bubbles:
+            data = light.data
+            bpy.data.objects.remove(light, do_unlink=True)
+            if data.users == 0:
+                bpy.data.lights.remove(data)
+    material = bpy.data.materials[scene["vp_optical_marker_material"]]
+    for name, bubble in bubbles.items():
+        light = sources.get(name)
+        if light is None:
+            light = bpy.data.objects.new(f"Scatter_{name}", bpy.data.lights.new(f"Scatter_{name}", "POINT"))
+            collection.objects.link(light)
+            light["vp_generated"], light["vp_role"], light["vp_bubble"] = True, "scatter_light", name
+        light.location = bubble.matrix_world.translation
+        light.data.shadow_soft_size = max(bubble.scale)
+        sample = project_to_pixel(body, light.location)
+        color = frame.get(tuple(math.floor(v + 0.5) for v in sample), (0, 0, 0, 1)) if sample else (0, 0, 0, 1)
+        distance = max((light.location - lens).length, 0.01)
+        pixel_area = 4 * distance * distance * tan_x * tan_z / (nx * nz)
+        intercepted = min(1.0, math.pi * max(bubble.scale) ** 2 / max(pixel_area, 1e-9))
+        intensity = max(color[:3])
+        light.data.energy = flux / (nx * nz) * intercepted * albedo * intensity
+        light.data.color = tuple(c / intensity for c in color[:3]) if intensity > 0 else (0, 0, 0)
+        bubble["vp_scattered_w"] = light.data.energy
+        display_scale = power * albedo * (scene["vp_flux_w"] / 180.0) if enabled else power
+        bubble.color = tuple(c * display_scale for c in color[:3]) + (1.0,)
+        if bubble.data.materials[0] != material:
+            bubble.data.materials[0] = material
+        bubble.visible_shadow = False
+    ray_material = bpy.data.materials[scene["vp_optical_ray_material"]]
+    for obj in scene.objects:
+        if obj.get("vp_role") in {"beam", "scatter", "image"}:
+            if obj.data.materials[0] != ray_material:
+                obj.data.materials[0] = ray_material
+            obj.visible_shadow = False
+    scene["vp_scattered_total_w"] = sum(o.data.energy for o in scene.objects if o.get("vp_role") == "scatter_light")
+    bpy.context.view_layer.update()
+
+
 def projection_frame(scene, body):
     nx, nz = body["vp_grid"]
     mode = scene.get("vp_content", "TEST")
+    source = bpy.data.images.get(scene.get("vp_source_image", "")) if mode == "IMAGE" else None
+    pixels = list(source.pixels) if source else None
     depths = {(obj["pixel_x"], obj["pixel_z"]): obj["depth_fraction"]
               for obj in scene.objects if obj.get("vp_role") == "bubble"}
     frame = {}
     for ix in range(nx):
         for iz in range(nz):
-            if mode == "WHITE":
+            if pixels:
+                width, height = source.size
+                x = min(width - 1, int((ix + 0.5) / nx * width))
+                y = min(height - 1, int((iz + 0.5) / nz * height))
+                offset = (y * width + x) * 4
+                rgba = pixels[offset:offset + 4]
+                color = tuple(c * rgba[3] for c in rgba[:3]) + (1.0,)
+            elif mode == "WHITE":
                 color = (1.0, 1.0, 1.0, 1.0)
             elif mode == "DEPTH":
                 depth = depths.get((ix, iz), 0.5)
@@ -1331,6 +1541,7 @@ def update_projection():
                 points[0].co = (*lens, 1.0)
                 points[-1].co = (*target, 1.0)
                 signal = frame.get((obj.get("pixel_x", -1), obj.get("pixel_z", -1)), (1, 1, 1, 1))
+                obj.color = tuple(c * power for c in signal[:3]) + (1.0,)
                 visible = scene.get("vp_show_rays", True) and not obj.get("vp_coarse", False)
                 set_visibility(obj, visible and power > 0 and max(signal[:3]) > 0.001)
             else:
@@ -1351,10 +1562,18 @@ def update_projection():
             set_visibility(obj, scene.get("vp_show_layers", False))
         elif obj.name.startswith(("Incoming_Light_Entry_Face", "Projected_Image_Exit_Face")):
             set_visibility(obj, False)
+    update_optical_projection(frame)
     for obj in scene.objects:
         if obj.get("vp_role") == "scatter":
             bubble = scene.objects.get(obj.get("vp_bubble", ""))
-            set_visibility(obj, bool(bubble and bubble.get("vp_lit") and scene.get("vp_show_scatter", False)))
+            if bubble:
+                start = bubble.matrix_world.translation
+                direction = Vector(obj.get("vp_direction", (0, 0, 1)))
+                obj.data.splines[0].points[0].co = (*start, 1)
+                obj.data.splines[0].points[-1].co = (*(start + direction * 0.18), 1)
+                obj.color = bubble.color
+            set_visibility(obj, bool(bubble and bubble.get("vp_lit") and scene.get("vp_show_scatter", False)
+                                     and scene.get("vp_scatter_albedo", 0) > 0))
     scene["vp_lit_count"] = lit_count
     scene["vp_total_count"] = sum(obj.get("vp_role") == "bubble" for obj in scene.objects)
 
@@ -1375,12 +1594,12 @@ def export_projection(output_dir=OUTPUT_DIR):
     with (output_dir / "bubble_coordinates.csv").open("w", newline="", encoding="utf-8-sig") as stream:
         writer = csv.writer(stream)
         writer.writerow(("name", "pixel_x_calibrated", "pixel_z_calibrated", "depth_fraction",
-                         "x_m", "y_m", "z_m", "pixel_x_current", "pixel_z_current", "lit"))
+                         "x_m", "y_m", "z_m", "pixel_x_current", "pixel_z_current", "lit", "scattered_w_approx"))
         for bubble in sorted((o for o in scene.objects if o.get("vp_role") == "bubble"), key=lambda o: (o["pixel_x"], o["pixel_z"])):
             position = bubble.matrix_world.translation
             sample = project_to_pixel(body, position) or ("", "")
             writer.writerow((bubble.name, bubble["pixel_x"], bubble["pixel_z"], bubble["depth_fraction"],
-                             *position, *sample, int(bubble["vp_lit"])))
+                             *position, *sample, int(bubble["vp_lit"]), bubble.get("vp_scattered_w", 0.0)))
     nx, nz = body["vp_grid"]
     frame = projection_frame(scene, body)
     image = bpy.data.images.new("Projection_Input_Export", width=nx, height=nz, alpha=True)
@@ -1391,6 +1610,13 @@ def export_projection(output_dir=OUTPUT_DIR):
         image.save()
     finally:
         bpy.data.images.remove(image)
+    metadata = {"model": "pinhole_with_isotropic_secondary_sources", "engine": scene.render.engine,
+                "parameters": {key: scene.get(key) for key in MODEL_KEYS + OPTICAL_KEYS},
+                "content": scene.get("vp_content"), "power": body.get("power"),
+                "projector_matrix_world": [list(row) for row in body.matrix_world],
+                "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+                "limitations": "No refraction, incident occlusion, multiple scattering, or primary-beam depletion."}
+    (output_dir / "projection_settings.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     log_step(f"已导出气泡坐标及投影输入图: {output_dir}")
 
 
@@ -1413,6 +1639,7 @@ def live_projection_tick():
     signature = (scene.as_pointer(), tuple(value for row in body.matrix_world for value in row),
                  parameters,
                  body.get("power", 1.0), scene.get("vp_content"),
+                 tuple(scene.get(key) for key in OPTICAL_KEYS),
                  tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_scatter", "vp_show_image", "vp_show_layers")),
                  tuple(tuple(o.matrix_world.translation) for o in scene.objects if o.get("vp_role") == "bubble"))
     if signature != runtime.get("signature"):
@@ -1449,9 +1676,12 @@ class VP_OT_content(bpy.types.Operator):
     bl_idname = "vp.content"
     bl_label = "投影内容"
     bl_options = {"REGISTER", "UNDO"}
-    mode: bpy.props.EnumProperty(items=[("TEST", "测试图", ""), ("WHITE", "全白", ""), ("DEPTH", "深度编码", "")])
+    mode: bpy.props.EnumProperty(items=[("TEST", "测试图", ""), ("WHITE", "全白", ""), ("DEPTH", "深度编码", ""), ("IMAGE", "图片", "")])
 
     def execute(self, context):
+        if self.mode == "IMAGE" and bpy.data.images.get(context.scene.get("vp_source_image", "")) is None:
+            self.report({"WARNING"}, "请先加载投影图片")
+            return {"CANCELLED"}
         context.scene["vp_content"] = self.mode
         update_projection()
         return {"FINISHED"}
@@ -1468,6 +1698,25 @@ class VP_OT_export(bpy.types.Operator):
             self.report({"ERROR"}, str(exc))
             return {"CANCELLED"}
         self.report({"INFO"}, str(OUTPUT_DIR))
+        return {"FINISHED"}
+
+
+class VP_OT_load_image(bpy.types.Operator):
+    bl_idname = "vp.load_image"
+    bl_label = "加载投影图片"
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.png;*.jpg;*.jpeg;*.bmp;*.tif;*.tiff;*.exr", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        try:
+            load_projection_image(self.filepath)
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
         return {"FINISHED"}
 
 
@@ -1500,7 +1749,14 @@ class VP_PT_controls(bpy.types.Panel):
         layout.separator()
         layout.prop(body, '["power"]', text="相对强度")
         layout.prop(scene, '["vp_auto"]', text="自动更新")
-        layout.operator_menu_enum("vp.content", "mode", text={"TEST": "测试图", "WHITE": "全白", "DEPTH": "深度编码"}.get(scene.get("vp_content"), "投影内容"))
+        layout.operator_menu_enum("vp.content", "mode", text={"TEST": "测试图", "WHITE": "全白", "DEPTH": "深度编码", "IMAGE": "图片"}.get(scene.get("vp_content"), "投影内容"))
+        layout.operator("vp.load_image", icon="IMAGE_DATA")
+        if scene.get("vp_source_image"):
+            layout.label(text=scene["vp_source_image"], icon="IMAGE_DATA")
+        layout.prop(scene, '["vp_optics"]', text="图像光照 / Cycles")
+        layout.prop(scene, '["vp_flux_w"]', text="光源功率 (W)")
+        layout.prop(scene, '["vp_scatter_albedo"]', text="散射比例")
+        layout.prop(scene, '["vp_show_receiver"]', text="接收屏")
         layout.label(text=f"照亮 {scene.get('vp_lit_count', 0)} / {scene.get('vp_total_count', 0)}")
         for key, label in (("vp_show_rays", "像素光线"), ("vp_show_scatter", "散射示意"),
                            ("vp_show_image", "参考图像平面"), ("vp_show_layers", "深度层")):
@@ -1517,7 +1773,7 @@ def register_projection_controls():
         bpy.app.timers.unregister(callback)
     for cls in reversed(runtime.get("classes", [])):
         bpy.utils.unregister_class(cls)
-    classes = (VP_OT_update, VP_OT_restore, VP_OT_content, VP_OT_export, VP_PT_controls)
+    classes = (VP_OT_update, VP_OT_restore, VP_OT_content, VP_OT_export, VP_OT_load_image, VP_PT_controls)
     for cls in classes:
         bpy.utils.register_class(cls)
     bpy._volume_projection_runtime = {"timer": live_projection_tick, "classes": classes}
@@ -1562,7 +1818,7 @@ def select_projector_for_manual_adjustment(scene_data: Dict[str, object]) -> Non
             with bpy.context.temp_override(**override):
                 space.region_3d.view_perspective = "CAMERA"
                 space.region_3d.view_camera_zoom = 0
-                space.shading.type = "MATERIAL"
+                space.shading.type = "RENDERED"
                 space.show_region_ui = True
         except Exception:
             pass
