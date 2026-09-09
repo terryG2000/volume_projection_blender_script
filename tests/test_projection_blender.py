@@ -386,6 +386,62 @@ class OpticalTests(unittest.TestCase):
             bubble = next(o for o in bubbles if o["pixel_x"] == beam["pixel_x"] and o["pixel_z"] == beam["pixel_z"])
             self.assertEqual(tuple(beam.color[:3]), tuple(bubble.color[:3]))
 
+    def test_hide_ray_geometry_preserves_illumination_and_restores_visibility(self):
+        self.scene["vp_content"] = "COLOR_BARS"
+        self.scene["vp_show_rays"] = True
+        self.scene["vp_show_scatter"] = True
+        projection.update_projection()
+        rays = [o for o in self.scene.objects if o.get("vp_role") in {"beam", "scatter"}]
+        visible_before = {o.name: (o.hide_get(), o.hide_render) for o in rays}
+        self.assertTrue(any(not o.hide_render for o in rays if o.get("vp_role") == "beam"))
+        self.assertTrue(any(not o.hide_render for o in rays if o.get("vp_role") == "scatter"))
+        bubbles = [o for o in self.scene.objects if o.get("vp_role") == "bubble"]
+        points_before = [(o.as_pointer(), tuple(o.location), tuple(o.color), o.hide_get(), o.hide_render) for o in bubbles]
+        lights = [o for o in self.scene.objects if o.type == "LIGHT"]
+        lights_before = [(o.name, o.data.energy, tuple(o.data.color), o.hide_get(), o.hide_render) for o in lights]
+        self.scene["vp_hide_ray_geometry"] = True
+        projection.update_projection()
+        self.assertTrue(all(o.hide_get() and o.hide_render for o in rays))
+        self.assertEqual(points_before, [(o.as_pointer(), tuple(o.location), tuple(o.color), o.hide_get(), o.hide_render) for o in bubbles])
+        self.assertEqual(lights_before, [(o.name, o.data.energy, tuple(o.data.color), o.hide_get(), o.hide_render) for o in lights])
+        self.assertTrue(self.scene["vp_show_rays"] and self.scene["vp_show_scatter"])
+        self.scene["vp_hide_ray_geometry"] = False
+        projection.update_projection()
+        self.assertEqual(visible_before, {o.name: (o.hide_get(), o.hide_render) for o in rays})
+        self.scene["vp_show_scatter"] = False
+        self.scene["vp_hide_ray_geometry"] = True
+        projection.update_projection()
+        self.scene["vp_hide_ray_geometry"] = False
+        projection.update_projection()
+        self.assertTrue(all(o.hide_render for o in rays if o.get("vp_role") == "scatter"))
+        self.assertTrue(any(not o.hide_render for o in rays if o.get("vp_role") == "beam"))
+
+    def test_hide_ray_geometry_updates_through_live_timer(self):
+        self.scene["vp_show_rays"] = True
+        projection.register_projection_controls()
+        with patch.object(projection.time, "monotonic", return_value=10.0):
+            projection.live_projection_tick()
+        with patch.object(projection.time, "monotonic", return_value=11.0):
+            projection.live_projection_tick()
+        rays = [o for o in self.scene.objects if o.get("vp_role") == "beam"]
+        self.assertTrue(any(not o.hide_render for o in rays))
+        self.scene["vp_hide_ray_geometry"] = True
+        with patch.object(projection.time, "monotonic", return_value=12.0):
+            projection.live_projection_tick()
+        self.assertTrue(all(o.hide_render and o.hide_get() for o in rays))
+
+    def test_old_scene_gets_hide_option_and_rerun_preserves_choice(self):
+        if "vp_hide_ray_geometry" in self.scene:
+            del self.scene["vp_hide_ray_geometry"]
+        self.scene["vp_show_rays"] = True
+        projection.main()
+        self.assertIn("vp_hide_ray_geometry", self.scene)
+        self.assertFalse(self.scene["vp_hide_ray_geometry"])
+        self.scene["vp_hide_ray_geometry"] = True
+        projection.main()
+        self.assertTrue(self.scene["vp_hide_ray_geometry"])
+        self.assertTrue(all(o.hide_render for o in self.scene.objects if o.get("vp_role") in {"beam", "scatter"}))
+
 
 if __name__ == "__main__":
     suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(ProjectionTests),

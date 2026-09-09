@@ -1292,7 +1292,7 @@ def project_to_pixel(body, world_position):
 def ensure_optical_settings(reset=False):
     scene = bpy.context.scene
     defaults = {"vp_optics": True, "vp_flux_w": 180.0, "vp_scatter_albedo": 0.65,
-                "vp_show_receiver": True, "vp_source_image": ""}
+                "vp_show_receiver": True, "vp_source_image": "", "vp_hide_ray_geometry": False}
     for key, value in defaults.items():
         if reset or key not in scene:
             scene[key] = value
@@ -1563,7 +1563,8 @@ def update_projection():
                 points[-1].co = (*target, 1.0)
                 signal = frame.get((obj.get("pixel_x", -1), obj.get("pixel_z", -1)), (1, 1, 1, 1))
                 obj.color = tuple(c * power for c in signal[:3]) + (1.0,)
-                visible = scene.get("vp_show_rays", True) and not obj.get("vp_coarse", False)
+                visible = (scene.get("vp_show_rays", True) and not obj.get("vp_coarse", False)
+                           and not scene.get("vp_hide_ray_geometry", False))
                 set_visibility(obj, visible and power > 0 and max(signal[:3]) > 0.001)
             else:
                 obj.location = target
@@ -1594,6 +1595,7 @@ def update_projection():
                 obj.data.splines[0].points[-1].co = (*(start + direction * 0.18), 1)
                 obj.color = bubble.color
             set_visibility(obj, bool(bubble and bubble.get("vp_lit") and scene.get("vp_show_scatter", False)
+                                     and not scene.get("vp_hide_ray_geometry", False)
                                      and scene.get("vp_scatter_albedo", 0) > 0))
     scene["vp_lit_count"] = lit_count
     scene["vp_total_count"] = sum(obj.get("vp_role") == "bubble" for obj in scene.objects)
@@ -1663,7 +1665,8 @@ def live_projection_tick():
                  parameters,
                  body.get("power", 1.0), scene.get("vp_content"),
                  tuple(scene.get(key) for key in OPTICAL_KEYS),
-                 tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_scatter", "vp_show_image", "vp_show_layers")),
+                 tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_scatter", "vp_show_image", "vp_show_layers",
+                                                  "vp_hide_ray_geometry")),
                  tuple(tuple(o.matrix_world.translation) for o in scene.objects if o.get("vp_role") == "bubble"))
     if signature != runtime.get("signature"):
         try:
@@ -1781,8 +1784,12 @@ class VP_PT_controls(bpy.types.Panel):
         layout.prop(scene, '["vp_scatter_albedo"]', text="散射比例")
         layout.prop(scene, '["vp_show_receiver"]', text="接收屏")
         layout.label(text=f"照亮 {scene.get('vp_lit_count', 0)} / {scene.get('vp_total_count', 0)}")
-        for key, label in (("vp_show_rays", "像素光线"), ("vp_show_scatter", "散射示意"),
-                           ("vp_show_image", "参考图像平面"), ("vp_show_layers", "深度层")):
+        layout.prop(scene, '["vp_hide_ray_geometry"]', text="隐藏实体光线")
+        ray_options = layout.column()
+        ray_options.enabled = not scene.get("vp_hide_ray_geometry", False)
+        for key, label in (("vp_show_rays", "像素光线"), ("vp_show_scatter", "散射示意")):
+            ray_options.prop(scene, f'["{key}"]', text=label)
+        for key, label in (("vp_show_image", "参考图像平面"), ("vp_show_layers", "深度层")):
             layout.prop(scene, f'["{key}"]', text=label)
         layout.operator("vp.update", icon="FILE_REFRESH")
         layout.operator("vp.restore", icon="LOOP_BACK")
