@@ -1,0 +1,47 @@
+{
+  "model": "pinhole_color_sampling",
+  "engine": "CYCLES",
+  "parameters": {
+    "vp_fov_x": 38.48436381279282,
+    "vp_fov_z": 28.070298602352867,
+    "vp_samples_x": 16,
+    "vp_samples_z": 10,
+    "vp_layers": 7,
+    "vp_radius": 0.027,
+    "vp_freeze_points": false,
+    "vp_optics": true,
+    "vp_flux_w": 180.0,
+    "vp_show_receiver": true,
+    "vp_source_image": ""
+  },
+  "content": "COLOR_BARS",
+  "power": 1.0,
+  "projector_matrix_world": [
+    [
+      1.149999976158142,
+      0.0,
+      0.0,
+      0.0
+    ],
+    [
+      0.0,
+      0.8999999761581421,
+      0.0,
+      1.25
+    ],
+    [
+      0.0,
+      0.0,
+      0.5199999809265137,
+      1.850000023841858
+    ],
+    [
+      0.0,
+      0.0,
+      0.0,
+      1.0
+    ]
+  ],
+  "source_sha256": "0449ef4b21e8dd10b6422288c96aae2bcbb8916a7a0031fc128b0568320927a5",
+  "limitations": "Color-only points; no point scattering, refracted color mapping, incident occlusion, or primary-beam depletion."
+}

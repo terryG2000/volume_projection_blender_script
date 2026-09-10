@@ -1,6 +1,7 @@
 """Run with Blender --background --factory-startup --python-exit-code 1 --python this_file."""
 import importlib.util
 import csv
+import json
 import math
 from pathlib import Path
 import sys
@@ -286,7 +287,7 @@ class OpticalTests(unittest.TestCase):
         self.body["power"] = 0
         projection.update_projection()
         self.assertEqual(spot.data.energy, 0)
-        self.assertTrue(all(o.data.energy == 0 for o in self.scene.objects if o.get("vp_role") == "scatter_light"))
+        self.assertFalse(any(o.get("vp_generated") and o.get("vp_role") == "scatter_light" for o in self.scene.objects))
 
     def test_image_sampling_matches_pixel_centers(self):
         image = bpy.data.images.new("Test_Quadrants", width=2, height=2, float_buffer=True)
@@ -302,18 +303,82 @@ class OpticalTests(unittest.TestCase):
         self.assertEqual(frame[0, 1], (0, 0, 1, 1))
         self.assertEqual(frame[1, 1], (1, 1, 1, 1))
 
-    def test_each_bubble_has_secondary_source_with_bounded_flux(self):
-        bubbles = [o for o in self.scene.objects if o.get("vp_role") == "bubble"]
-        lights = [o for o in self.scene.objects if o.get("vp_role") == "scatter_light"]
-        self.assertEqual(len(lights), len(bubbles))
-        for light in lights:
-            bubble = self.scene.objects[light["vp_bubble"]]
-            self.assertLess((light.location - bubble.location).length, 1e-5)
-            self.assertEqual(light.data.energy > 0, bool(bubble["vp_lit"]))
-        self.assertLess(sum(light.data.energy for light in lights), self.scene["vp_flux_w"])
-        self.scene["vp_scatter_albedo"] = 0
+    def test_points_sample_color_without_scattering_or_albedo_attenuation(self):
+        self.scene["vp_content"] = "WHITE"
+        for legacy_albedo in (0.0, 0.3, 1.0):
+            self.scene["vp_scatter_albedo"] = legacy_albedo
+            projection.update_projection()
+            bubbles = [o for o in self.scene.objects if o.get("vp_role") == "bubble"]
+            self.assertTrue(bubbles)
+            self.assertTrue(all(tuple(o.color[:3]) == (1, 1, 1) for o in bubbles))
+            self.assertFalse(any(o.get("vp_generated") and o.get("vp_role") in {"scatter_light", "scatter"} for o in self.scene.objects))
+        self.body["power"] = 0.5
         projection.update_projection()
-        self.assertTrue(all(light.data.energy == 0 for light in lights))
+        self.assertTrue(all(tuple(o.color[:3]) == (0.5, 0.5, 0.5) for o in bubbles))
+
+    def test_old_scattering_is_removed_without_deleting_user_lights(self):
+        self.scene["vp_freeze_points"] = True
+        points = [(o.as_pointer(), tuple(o.location)) for o in self.scene.objects if o.get("vp_role") == "bubble"]
+        for name, generated, kind in (("Legacy_Scatter_Light", True, "POINT"),
+                                       ("User_Light", False, "POINT"),
+                                       ("Legacy_Scatter_Curve", True, "CURVE")):
+            data = bpy.data.curves.new(name, "CURVE") if kind == "CURVE" else bpy.data.lights.new(name, kind)
+            obj = bpy.data.objects.new(name, data)
+            self.scene.collection.objects.link(obj)
+            obj["vp_role"] = "scatter" if kind == "CURVE" else "scatter_light"
+            obj["vp_generated"] = generated
+            obj["vp_bubble"] = "Missing_" + name
+            if kind == "CURVE":
+                data.splines.new("POLY").points.add(1)
+                data.materials.append(bpy.data.materials[self.scene["vp_optical_ray_material"]])
+        user_light = self.scene.objects["User_Light"]
+        self.addCleanup(bpy.data.objects.remove, user_light, do_unlink=True)
+        user_light.data.energy = 7.0
+        projection.main()
+        projection.update_projection()
+        self.assertNotIn("Legacy_Scatter_Light", self.scene.objects)
+        self.assertNotIn("Legacy_Scatter_Curve", self.scene.objects)
+        self.assertIn("User_Light", self.scene.objects)
+        self.assertEqual(user_light.data.energy, 7.0)
+        self.assertEqual(points, [(o.as_pointer(), tuple(o.location)) for o in self.scene.objects if o.get("vp_role") == "bubble"])
+        self.scene["vp_samples_x"] = 20
+        projection.update_projection()
+        self.assertFalse(any(o.get("vp_generated") and o.get("vp_role") in {"scatter", "scatter_light"} for o in self.scene.objects))
+
+    def test_export_identifies_color_only_model(self):
+        out = ROOT / "tmp" / "color_only_export"
+        projection.export_projection(out)
+        settings = json.loads((out / "projection_settings.json").read_text(encoding="utf-8"))
+        self.assertEqual(settings["model"], "pinhole_color_sampling")
+        self.assertNotIn("vp_scatter_albedo", settings["parameters"])
+        with (out / "bubble_coordinates.csv").open(encoding="utf-8-sig", newline="") as stream:
+            rows = list(csv.DictReader(stream))
+        self.assertTrue(rows)
+        self.assertTrue(all(float(row["scattered_w_approx"]) == 0 for row in rows))
+
+    def test_scattering_migration_preserves_other_scenes(self):
+        other = bpy.data.scenes.new("Reference_Scattering")
+        self.addCleanup(bpy.data.scenes.remove, other)
+        shared = bpy.data.collections.new("Shared_Scattering")
+        self.scene.collection.children.link(shared)
+        other.collection.children.link(shared)
+        for name, collection in (("Shared_Collection_Light", shared),
+                                  ("Shared_Object_Light", self.scene.collection)):
+            obj = bpy.data.objects.new(name, bpy.data.lights.new(name, "POINT"))
+            obj["vp_generated"], obj["vp_role"] = True, "scatter_light"
+            obj.data.energy = 7.0
+            collection.objects.link(obj)
+            if collection == self.scene.collection:
+                other.collection.objects.link(obj)
+        untouched = bpy.data.objects.new("Shared_User_Object", None)
+        shared.objects.link(untouched)
+        projection.update_projection()
+        for name in ("Shared_Collection_Light", "Shared_Object_Light"):
+            self.assertNotIn(name, self.scene.objects)
+            self.assertIn(name, other.objects)
+            self.assertEqual(other.objects[name].data.energy, 7.0)
+        self.assertIn(untouched.name, self.scene.objects)
+        self.assertIn(untouched.name, other.objects)
 
     def test_receiver_is_fixed_and_non_emissive(self):
         self.assertIn("vp_receiver", self.scene)
@@ -338,7 +403,7 @@ class OpticalTests(unittest.TestCase):
             projection.load_projection_image(str(out / "does_not_exist.png"))
         self.assertEqual(name, self.scene["vp_source_image"])
 
-    def test_zero_source_power_darks_scatter_markers(self):
+    def test_zero_source_power_darks_color_points(self):
         self.scene["vp_flux_w"] = 0.0
         projection.update_projection()
         for obj in self.scene.objects:
@@ -381,7 +446,6 @@ class OpticalTests(unittest.TestCase):
         self.scene["vp_source_image"] = image.name
         self.scene["vp_content"] = "IMAGE"
         self.scene["vp_samples_x"] = self.scene["vp_samples_z"] = 2
-        self.scene["vp_scatter_albedo"] = 1.0
         projection.update_projection()
         self.scene["vp_freeze_points"] = True
         bubble = next(o for o in self.scene.objects if o.get("vp_role") == "bubble" and o["pixel_x"] == 0)
@@ -391,22 +455,17 @@ class OpticalTests(unittest.TestCase):
         projection.update_projection()
         # u=0.1 is red in the original 4-column image; the coarse cell center is green.
         self.assertEqual(tuple(bubble.color[:3]), (1, 0, 0))
-        secondary = next(o for o in self.scene.objects if o.get("vp_role") == "scatter_light" and o["vp_bubble"] == bubble.name)
-        self.assertEqual(tuple(secondary.data.color), (1, 0, 0))
         # Moving the projector shifts this fixed point into a different original-image column.
         self.body.location.x -= 0.6
         projection.update_projection()
         self.assertEqual(tuple(bubble.color[:3]), (0, 1, 0))
-        self.assertEqual(tuple(secondary.data.color), (0, 1, 0))
         self.body.rotation_euler.z = math.pi
         projection.update_projection()
         self.assertEqual(tuple(bubble.color[:3]), (0, 0, 0))
-        self.assertEqual(secondary.data.energy, 0)
 
     def test_color_bars_give_ray_and_point_the_same_hue(self):
         self.scene["vp_content"] = "COLOR_BARS"
         self.scene["vp_show_rays"] = True
-        self.scene["vp_scatter_albedo"] = 1.0
         projection.update_projection()
         bubbles = [o for o in self.scene.objects if o.get("vp_role") == "bubble"]
         self.assertGreaterEqual(len({tuple(o.color[:3]) for o in bubbles}), 6)
@@ -419,12 +478,10 @@ class OpticalTests(unittest.TestCase):
     def test_hide_ray_geometry_preserves_illumination_and_restores_visibility(self):
         self.scene["vp_content"] = "COLOR_BARS"
         self.scene["vp_show_rays"] = True
-        self.scene["vp_show_scatter"] = True
         projection.update_projection()
-        rays = [o for o in self.scene.objects if o.get("vp_role") in {"beam", "scatter"}]
+        rays = [o for o in self.scene.objects if o.get("vp_role") == "beam"]
         visible_before = {o.name: (o.hide_get(), o.hide_render) for o in rays}
         self.assertTrue(any(not o.hide_render for o in rays if o.get("vp_role") == "beam"))
-        self.assertTrue(any(not o.hide_render for o in rays if o.get("vp_role") == "scatter"))
         bubbles = [o for o in self.scene.objects if o.get("vp_role") == "bubble"]
         points_before = [(o.as_pointer(), tuple(o.location), tuple(o.color), o.hide_get(), o.hide_render) for o in bubbles]
         lights = [o for o in self.scene.objects if o.type == "LIGHT"]
@@ -434,17 +491,16 @@ class OpticalTests(unittest.TestCase):
         self.assertTrue(all(o.hide_get() and o.hide_render for o in rays))
         self.assertEqual(points_before, [(o.as_pointer(), tuple(o.location), tuple(o.color), o.hide_get(), o.hide_render) for o in bubbles])
         self.assertEqual(lights_before, [(o.name, o.data.energy, tuple(o.data.color), o.hide_get(), o.hide_render) for o in lights])
-        self.assertTrue(self.scene["vp_show_rays"] and self.scene["vp_show_scatter"])
+        self.assertTrue(self.scene["vp_show_rays"])
         self.scene["vp_hide_ray_geometry"] = False
         projection.update_projection()
         self.assertEqual(visible_before, {o.name: (o.hide_get(), o.hide_render) for o in rays})
-        self.scene["vp_show_scatter"] = False
+        self.scene["vp_show_rays"] = False
         self.scene["vp_hide_ray_geometry"] = True
         projection.update_projection()
         self.scene["vp_hide_ray_geometry"] = False
         projection.update_projection()
-        self.assertTrue(all(o.hide_render for o in rays if o.get("vp_role") == "scatter"))
-        self.assertTrue(any(not o.hide_render for o in rays if o.get("vp_role") == "beam"))
+        self.assertTrue(all(o.hide_render for o in rays))
 
     def test_hide_ray_geometry_updates_through_live_timer(self):
         self.scene["vp_show_rays"] = True

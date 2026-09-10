@@ -1,4 +1,4 @@
-"""Render checks: projected color, secondary illumination, and non-reflective glass."""
+"""Render checks: projected color, non-illuminating points, and non-reflective glass."""
 import importlib.util
 import math
 from pathlib import Path
@@ -17,7 +17,6 @@ source = bpy.data.images.new("Render_Quadrants", width=2, height=2, float_buffer
 source.pixels = [1, 0, 0, 1, 0, 1, 0, 1, 0, 0, 1, 1, 1, 1, 1, 1]
 scene["vp_source_image"] = source.name
 scene["vp_content"] = "IMAGE"
-scene["vp_scatter_albedo"] = 0.0
 scene["vp_flux_w"] = 1500.0
 p.update_projection()
 spot = scene.objects[scene["vp_spot"]]
@@ -70,17 +69,19 @@ assert max(off[0::4]) < 0.001, "Receiver still lit with all light sources off"
 
 scene["vp_content"] = "WHITE"
 scene["vp_flux_w"] = 5000.0
-scene["vp_scatter_albedo"] = 1.0
 p.update_projection()
 spot.data.energy = 0
 for obj in scene.objects:
-    if obj.type not in {"LIGHT", "CAMERA"} and obj.get("vp_role") != "receiver":
+    if obj.get("vp_role") == "bubble":
+        obj.hide_render = False
+        obj.visible_camera = False
+        obj.visible_diffuse = True
+        assert max(obj.color[:3]) > 0, "Point display must remain colored during the illumination probe"
+    elif obj.type not in {"LIGHT", "CAMERA"} and obj.get("vp_role") != "receiver":
         obj.hide_render = True
-scatter = render("scatter_only")
-mean = sum(scatter[0::4]) / (64 * 64)
-print("SCATTER_ONLY_MEAN", mean, flush=True)
-assert mean > 0.001, "Secondary sources did not illuminate the receiver"
-print("PASS: projected RGB orientation, power-off, and secondary illumination", flush=True)
+points_only = render("colored_points_no_illumination")
+assert max(points_only[0::4] + points_only[1::4] + points_only[2::4]) < 0.001, "Colored points still illuminate the receiver"
+print("PASS: projected RGB orientation, power-off, and non-illuminating colored points", flush=True)
 
 # A ray-filtered world isolates reflection from transmission and direct visibility.
 glass_material = scene.objects[scene["vp_volume"]].data.materials[0]

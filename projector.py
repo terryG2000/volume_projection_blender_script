@@ -3,7 +3,7 @@
 体积投影仿真建模脚本
 
 在 Blender 中运行本脚本，会创建一个普通投影仪向透明玻璃立方体投影的场景。
-立方体内部的微小气泡按投影图案和深度层分布，每个气泡代表一个可散射光的体素/像素点。
+立方体内部的微小气泡按投影图案和深度层分布，每个球体直接显示当前投影光路的颜色，不参与散射照明。
 
 GUI 保留窗口运行示例：
     blender.exe --python projector.py -- --keep-open
@@ -47,11 +47,10 @@ BUBBLE_PATH_RAY_LIMIT = 160 if FAST_PREVIEW else 260
 SCENE_VERSION = 2
 DEPTH_SEED = 2006
 MODEL_KEYS = ("vp_fov_x", "vp_fov_z", "vp_samples_x", "vp_samples_z", "vp_layers", "vp_radius", "vp_freeze_points")
-OPTICAL_KEYS = ("vp_optics", "vp_flux_w", "vp_scatter_albedo", "vp_show_receiver", "vp_source_image")
+OPTICAL_KEYS = ("vp_optics", "vp_flux_w", "vp_show_receiver", "vp_source_image")
 
 RAY_GRID_X = 6 if FAST_PREVIEW else 13
 RAY_GRID_Z = 4 if FAST_PREVIEW else 9
-SCATTER_SAMPLE_LIMIT = 18 if FAST_PREVIEW else 90
 
 OUTPUT_DIR = Path(__file__).resolve().parent / "outputs"
 PREVIEW_IMAGE_PATH = OUTPUT_DIR / "volume_projection_preview.png"
@@ -808,58 +807,6 @@ def create_ray_aligned_bubble_paths(
 
     return paths
 
-def create_scattering_rays(
-    bubble_field: BubbleField,
-    camera_location: Vector,
-    collection: bpy.types.Collection,
-    materials: Dict[str, bpy.types.Material],
-) -> List[bpy.types.Object]:
-    scatter: List[bpy.types.Object] = []
-    if not bubble_field.active_bubbles:
-        return scatter
-
-    stride = max(1, len(bubble_field.active_bubbles) // SCATTER_SAMPLE_LIMIT)
-    selected = bubble_field.active_bubbles[::stride][:SCATTER_SAMPLE_LIMIT]
-
-    for index, bubble in enumerate(selected):
-        start = bubble.location
-        to_camera = (camera_location - start).normalized()
-        side = Vector((
-            0.35 + (stable_hash(index, 0, 11) - 0.5) * 0.42,
-            0.30 + (stable_hash(index, 0, 12) - 0.5) * 0.22,
-            (stable_hash(index, 0, 13) - 0.5) * 0.55,
-        )).normalized()
-
-        length_a = 0.34 + stable_hash(index, 0, 14) * 0.34
-        length_b = 0.22 + stable_hash(index, 0, 15) * 0.28
-
-        scatter.append(
-            create_curve(
-                f"Bubble_Scatter_ToCamera_{index:03d}",
-                (start, start + to_camera * length_a),
-                materials["scatter"],
-                0.004,
-                collection,
-            )
-        )
-        scatter[-1]["vp_role"] = "scatter"
-        scatter[-1]["vp_bubble"] = bubble.name
-        if index % 3 == 0:
-            scatter.append(
-                create_curve(
-                    f"Bubble_Scatter_Side_{index:03d}",
-                    (start, start + side * length_b),
-                    materials["scatter_side"],
-                    0.0028,
-                    collection,
-                )
-            )
-            scatter[-1]["vp_role"] = "scatter"
-            scatter[-1]["vp_bubble"] = bubble.name
-
-    return scatter
-
-
 def create_laser_written_guides(
     volume: ProjectionVolume,
     collection: bpy.types.Collection,
@@ -960,8 +907,6 @@ def build_materials() -> Dict[str, bpy.types.Material]:
         "ray": create_emission_material("Mat_Projector_Thin_Rays", (0.02, 0.018, 0.012, 1.0), 0.35),
         "bubble_path_ray": create_emission_material("Mat_Ray_Aligned_Bubble_Paths", (1.0, 0.82, 0.18, 1.0), 1.15),
         "frustum": create_glass_material("Mat_Faint_Yellow_Light_Frustum", (1.0, 0.84, 0.18, 1.0), 0.08),
-        "scatter": create_emission_material("Mat_Bubble_Scatter_White", (0.92, 0.98, 1.0, 1.0), 3.6),
-        "scatter_side": create_emission_material("Mat_Bubble_Scatter_Cyan", (0.35, 0.92, 1.0, 1.0), 2.4),
         "writing_laser": create_emission_material("Mat_Laser_Written_Bubble_Guide", (0.55, 0.26, 1.0, 1.0), 2.8),
         "pixel_object_color": create_object_color_emission_material("Mat_Projected_Image_Pixel_ObjectColor", 2.5),
         "bubble_object_color": create_object_color_emission_material("Mat_Bubble_ObjectColor", 2.2),
@@ -1003,7 +948,7 @@ def build_scene() -> Dict[str, object]:
     volume.create(collections["volume"], materials)
 
     log_step("设置相机、灯光和地面...")
-    camera_location = setup_scene(volume.center)
+    setup_scene(volume.center)
     create_floor(materials["floor"], collections["environment"])
 
     log_step(f"创建投影图案像素: {IMAGE_GRID_X} x {IMAGE_GRID_Z}...")
@@ -1018,9 +963,6 @@ def build_scene() -> Dict[str, object]:
 
     log_step("创建气泡路径验证光线...")
     create_ray_aligned_bubble_paths(projector, bubble_field, collections["rays"], materials)
-
-    log_step("创建气泡散射光线...")
-    create_scattering_rays(bubble_field, camera_location, collections["rays"], materials)
 
     log_step("创建激光写入辅助路径...")
     create_laser_written_guides(volume, collections["rays"], materials)
@@ -1079,7 +1021,6 @@ def initialize_projection(projector, volume):
     scene["vp_content"] = "TEST"
     scene["vp_auto"] = True
     scene["vp_show_rays"] = False
-    scene["vp_show_scatter"] = True
     scene["vp_show_image"] = False
     scene["vp_show_layers"] = False
     for obj in scene.objects:
@@ -1116,13 +1057,13 @@ def ensure_model_parameters(reset=False):
                 low, high = limits[key]
                 scene.id_properties_ui(key).update(min=low, max=high)
     roles = {role: next((o for o in scene.objects if o.get("vp_role") == role), None)
-             for role in ("bubble", "image", "beam", "scatter")}
+             for role in ("bubble", "image", "beam")}
     for role in ("bubble", "image"):
         obj = roles[role]
         if obj:
             scene[f"vp_{role}_mesh"] = obj.data.name
             scene[f"vp_{role}_collection"] = obj.users_collection[0].name
-    for role in ("beam", "scatter"):
+    for role in ("beam",):
         obj = roles[role]
         if obj:
             scene[f"vp_{role}_material"] = obj.data.materials[0].name
@@ -1180,13 +1121,12 @@ def rebuild_point_cloud():
     image_collection = bpy.data.collections[scene["vp_image_collection"]]
     rays_collection = bpy.data.collections[scene["vp_rays_collection"]]
     beam_material = bpy.data.materials[scene["vp_beam_material"]]
-    scatter_material = bpy.data.materials[scene["vp_scatter_material"]]
     nx, nz = body["vp_grid"]
     layers = int(scene["vp_layers"])
     radius_limit = float(scene["vp_radius"])
     old_curves = []
     for obj in list(scene.objects):
-        if obj.get("vp_generated") and (obj.get("vp_role") in {"bubble", "image", "beam", "scatter", "frustum", "writing"}
+        if obj.get("vp_generated") and (obj.get("vp_role") in {"bubble", "image", "beam", "frustum", "writing"}
                                          or obj.name.startswith("Bubble_Depth_Layer_")):
             if obj.type == "CURVE":
                 old_curves.append(obj.data)
@@ -1240,14 +1180,6 @@ def rebuild_point_cloud():
             bubble["depth_fraction"] = fraction
             bubble["vp_design_position"] = list(position)
             points.append(bubble)
-    for index, bubble in enumerate(points[::max(1, math.ceil(len(points) / SCATTER_SAMPLE_LIMIT))]):
-        start = bubble.location
-        for axis, direction in enumerate(((1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1))):
-            scatter = create_curve(f"Bubble_Scatter_{index:03d}_{axis}", (start, start + Vector(direction) * 0.18), scatter_material, 0.0016, rays_collection)
-            scatter["vp_role"] = "scatter"
-            scatter["vp_bubble"] = bubble.name
-            scatter["vp_direction"] = direction
-            scatter["vp_generated"] = True
     for layer in range(1, layers):
         y = 0.5 - layer / layers
         coords = [volume.matrix_world @ Vector((x, y, z)) for x, z in ((-.5, -.5), (.5, -.5), (.5, .5), (-.5, .5), (-.5, -.5))]
@@ -1323,15 +1255,13 @@ def project_to_pixel(body, world_position):
 
 def ensure_optical_settings(reset=False):
     scene = bpy.context.scene
-    defaults = {"vp_optics": True, "vp_flux_w": 180.0, "vp_scatter_albedo": 0.65,
+    defaults = {"vp_optics": True, "vp_flux_w": 180.0,
                 "vp_show_receiver": True, "vp_source_image": "", "vp_hide_ray_geometry": False}
     for key, value in defaults.items():
         if reset or key not in scene:
             scene[key] = value
     scene["vp_flux_w"] = max(0.0, float(scene["vp_flux_w"]))
-    scene["vp_scatter_albedo"] = clamp(float(scene["vp_scatter_albedo"]), 0.0, 1.0)
     scene.id_properties_ui("vp_flux_w").update(min=0.0, max=5000.0)
-    scene.id_properties_ui("vp_scatter_albedo").update(min=0.0, max=1.0)
 
 
 def load_projection_image(filepath):
@@ -1420,8 +1350,51 @@ def create_optical_rig():
     receiver["vp_generated"], receiver["vp_role"] = True, "receiver"
     scene["vp_spot"], scene["vp_receiver"] = spot.name, receiver.name
     scene["vp_optical_collection"] = collection.name
-    scene["vp_optical_marker_material"] = camera_only_material("Mat_Optical_Markers", 2.0).name
+    scene["vp_optical_marker_material"] = camera_only_material("Mat_Optical_Markers", 1.0).name
     scene["vp_optical_ray_material"] = camera_only_material("Mat_Colored_Optical_Rays", 1.0).name
+
+
+def remove_legacy_scattering(scene):
+    legacy = {o for o in scene.objects
+              if o.get("vp_generated") and o.get("vp_role") in {"scatter_light", "scatter"}}
+    if not legacy:
+        return
+    shared_collections = set()
+    pending = [other.collection for other in bpy.data.scenes if other != scene]
+    while pending:
+        collection = pending.pop()
+        if collection not in shared_collections:
+            shared_collections.add(collection)
+            pending.extend(collection.children)
+
+    def unlink_from(collection):
+        for child in list(collection.children):
+            if not any(obj in legacy for obj in child.all_objects):
+                continue
+            # Copy shared collection links before editing the current scene only.
+            if child in shared_collections:
+                private = child.copy()
+                collection.children.unlink(child)
+                collection.children.link(private)
+                for key in list(scene.keys()):
+                    if key.startswith("vp_") and key.endswith("_collection") and scene[key] == child.name:
+                        scene[key] = private.name
+                child = private
+            unlink_from(child)
+        for obj in list(collection.objects):
+            if obj in legacy:
+                collection.objects.unlink(obj)
+
+    unlink_from(scene.collection)
+    for obj in legacy:
+        if obj.users == 0:
+            data, kind = obj.data, obj.type
+            bpy.data.objects.remove(obj)
+            if data and data.users == 0:
+                if kind == "LIGHT":
+                    bpy.data.lights.remove(data)
+                elif kind == "CURVE":
+                    bpy.data.curves.remove(data)
 
 
 def update_optical_projection(frame):
@@ -1432,13 +1405,11 @@ def update_optical_projection(frame):
     body = projection_body()
     spot = scene.objects[scene["vp_spot"]]
     receiver = scene.objects.get(scene.get("vp_receiver", ""))
-    collection = bpy.data.collections[scene["vp_optical_collection"]]
     enabled = bool(scene["vp_optics"])
     if enabled and scene.render.engine != "CYCLES":
         scene.render.engine = "CYCLES"
     power = max(0.0, float(body.get("power", 1)))
     flux = max(0.0, float(scene["vp_flux_w"])) * power if enabled else 0.0
-    albedo = clamp(float(scene["vp_scatter_albedo"]), 0, 1)
     lens = body.matrix_world @ Vector(body["vp_lens_local"])
     rotation = body.matrix_world.to_quaternion()
     spot.location = lens
@@ -1472,43 +1443,23 @@ def update_optical_projection(frame):
     for obj in scene.objects:
         if obj.get("vp_generated") and obj.name.startswith("Projector_Lens"):
             obj.visible_shadow = False
-    bubbles = {o.name: o for o in scene.objects if o.get("vp_role") == "bubble"}
-    sources = {o.get("vp_bubble"): o for o in scene.objects if o.get("vp_role") == "scatter_light"}
-    for name, light in list(sources.items()):
-        if name not in bubbles:
-            data = light.data
-            bpy.data.objects.remove(light, do_unlink=True)
-            if data.users == 0:
-                bpy.data.lights.remove(data)
+    remove_legacy_scattering(scene)
     material = bpy.data.materials[scene["vp_optical_marker_material"]]
-    for name, bubble in bubbles.items():
-        light = sources.get(name)
-        if light is None:
-            light = bpy.data.objects.new(f"Scatter_{name}", bpy.data.lights.new(f"Scatter_{name}", "POINT"))
-            collection.objects.link(light)
-            light["vp_generated"], light["vp_role"], light["vp_bubble"] = True, "scatter_light", name
-        light.location = bubble.matrix_world.translation
-        light.data.shadow_soft_size = max(bubble.scale)
-        color = tuple(bubble["vp_incident_color"])
-        distance = max((light.location - lens).length, 0.01)
-        pixel_area = 4 * distance * distance * tan_x * tan_z / (nx * nz)
-        intercepted = min(1.0, math.pi * max(bubble.scale) ** 2 / max(pixel_area, 1e-9))
-        intensity = max(color[:3])
-        light.data.energy = flux / (nx * nz) * intercepted * albedo * intensity
-        light.data.color = tuple(c / intensity for c in color[:3]) if intensity > 0 else (0, 0, 0)
-        bubble["vp_scattered_w"] = light.data.energy
-        display_scale = power * albedo * (scene["vp_flux_w"] / 180.0) if enabled else power
-        bubble.color = tuple(c * display_scale for c in color[:3]) + (1.0,)
+    for node in material.node_tree.nodes:
+        if node.type == "EMISSION":
+            node.inputs["Strength"].default_value = 1.0
+    for bubble in (o for o in scene.objects if o.get("vp_role") == "bubble"):
+        bubble["vp_scattered_w"] = 0.0
         if bubble.data.materials[0] != material:
             bubble.data.materials[0] = material
         bubble.visible_shadow = False
     ray_material = bpy.data.materials[scene["vp_optical_ray_material"]]
     for obj in scene.objects:
-        if obj.get("vp_role") in {"beam", "scatter", "image"}:
+        if obj.get("vp_role") in {"beam", "image"}:
             if obj.data.materials[0] != ray_material:
                 obj.data.materials[0] = ray_material
             obj.visible_shadow = False
-    scene["vp_scattered_total_w"] = sum(o.data.energy for o in scene.objects if o.get("vp_role") == "scatter_light")
+    scene["vp_scattered_total_w"] = 0.0
     bpy.context.view_layer.update()
 
 
@@ -1579,6 +1530,8 @@ def update_projection():
     frame = projection_frame(scene, body, image_data)
     lit_count = 0
     power = max(0.0, float(body.get("power", 1.0)))
+    if scene.get("vp_optics", True) and float(scene.get("vp_flux_w", 180.0)) <= 0:
+        power = 0.0
     for obj in scene.objects:
         role = obj.get("vp_role")
         if role == "bubble":
@@ -1618,18 +1571,6 @@ def update_projection():
         elif obj.name.startswith(("Incoming_Light_Entry_Face", "Projected_Image_Exit_Face")):
             set_visibility(obj, False)
     update_optical_projection(frame)
-    for obj in scene.objects:
-        if obj.get("vp_role") == "scatter":
-            bubble = scene.objects.get(obj.get("vp_bubble", ""))
-            if bubble:
-                start = bubble.matrix_world.translation
-                direction = Vector(obj.get("vp_direction", (0, 0, 1)))
-                obj.data.splines[0].points[0].co = (*start, 1)
-                obj.data.splines[0].points[-1].co = (*(start + direction * 0.18), 1)
-                obj.color = bubble.color
-            set_visibility(obj, bool(bubble and bubble.get("vp_lit") and scene.get("vp_show_scatter", False)
-                                     and not scene.get("vp_hide_ray_geometry", False)
-                                     and scene.get("vp_scatter_albedo", 0) > 0))
     scene["vp_lit_count"] = lit_count
     scene["vp_total_count"] = sum(obj.get("vp_role") == "bubble" for obj in scene.objects)
 
@@ -1668,12 +1609,12 @@ def export_projection(output_dir=OUTPUT_DIR):
         image.save()
     finally:
         bpy.data.images.remove(image)
-    metadata = {"model": "pinhole_with_isotropic_secondary_sources", "engine": scene.render.engine,
+    metadata = {"model": "pinhole_color_sampling", "engine": scene.render.engine,
                 "parameters": {key: scene.get(key) for key in MODEL_KEYS + OPTICAL_KEYS},
                 "content": scene.get("vp_content"), "power": body.get("power"),
                 "projector_matrix_world": [list(row) for row in body.matrix_world],
                 "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-                "limitations": "No refraction, incident occlusion, multiple scattering, or primary-beam depletion."}
+                "limitations": "Color-only points; no point scattering, refracted color mapping, incident occlusion, or primary-beam depletion."}
     (output_dir / "projection_settings.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     log_step(f"已导出气泡坐标及投影输入图: {output_dir}")
 
@@ -1698,7 +1639,7 @@ def live_projection_tick():
                  parameters,
                  body.get("power", 1.0), scene.get("vp_content"),
                  tuple(scene.get(key) for key in OPTICAL_KEYS),
-                 tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_scatter", "vp_show_image", "vp_show_layers",
+                 tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_image", "vp_show_layers",
                                                   "vp_hide_ray_geometry")),
                  tuple(tuple(o.matrix_world.translation) for o in scene.objects if o.get("vp_role") == "bubble"))
     if signature != runtime.get("signature"):
@@ -1814,14 +1755,12 @@ class VP_PT_controls(bpy.types.Panel):
             layout.label(text=scene["vp_source_image"], icon="IMAGE_DATA")
         layout.prop(scene, '["vp_optics"]', text="图像光照 / Cycles")
         layout.prop(scene, '["vp_flux_w"]', text="光源功率 (W)")
-        layout.prop(scene, '["vp_scatter_albedo"]', text="散射比例")
         layout.prop(scene, '["vp_show_receiver"]', text="接收屏")
         layout.label(text=f"照亮 {scene.get('vp_lit_count', 0)} / {scene.get('vp_total_count', 0)}")
         layout.prop(scene, '["vp_hide_ray_geometry"]', text="隐藏实体光线")
         ray_options = layout.column()
         ray_options.enabled = not scene.get("vp_hide_ray_geometry", False)
-        for key, label in (("vp_show_rays", "像素光线"), ("vp_show_scatter", "散射示意")):
-            ray_options.prop(scene, f'["{key}"]', text=label)
+        ray_options.prop(scene, '["vp_show_rays"]', text="像素光线")
         for key, label in (("vp_show_image", "参考图像平面"), ("vp_show_layers", "深度层")):
             layout.prop(scene, f'["{key}"]', text=label)
         layout.operator("vp.update", icon="FILE_REFRESH")
