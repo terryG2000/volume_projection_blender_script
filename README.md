@@ -9,6 +9,7 @@
 - `projector.py`：唯一的模型运行入口，包含建模、材质、光线映射和侧栏控制；不依赖本地 `classes` 或 `utils` 包。
 - `tests/test_projection_blender.py`：Blender 回归测试。
 - `tests/test_optical_render_blender.py`：实际渲染验证，检查 RGB 方向、关灯响应、球体不照亮其他物体和玻璃透射。
+- `tests/test_denoise_render_blender.py`：OptiX 下 12 采样的降噪前后对照，检查地面颗粒与高饱和像素保留。
 - `README.md`、`CHANGELOG.md`、`AGENTS.md`：使用说明、变更历史和维护约定。
 - `Nayar_TR06.pdf`：参考论文，保留原文件。
 - `outputs/`：可编辑场景、预览及导出数据，保留已有结果。
@@ -74,14 +75,23 @@
 & 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' 'outputs\volume_projection_gpu.blend' --python projector.py -- --keep-open
 ```
 
-这份 GPU 演示单独保存，原 `volume_projection_color_only.blend` 不变。已有场景运行新版脚本也会切换 GPU，并保留手动位置、点云模式、采样数和降噪设置。
-新建场景仍为最终 32 采样、视口 12 采样；本次不额外开启视口降噪。首次 GPU 初始化/内核编译仍可能等待，旋转视角仍会重新采样。
+这份 GPU 演示单独保存，原 `volume_projection_color_only.blend` 不变。已有场景运行新版脚本也会切换 GPU，并保留手动位置、点云模式、采样数和最终渲染降噪设置；视口降噪会重新开启。
+新建场景仍为最终 32 采样、视口 12 采样；视口现在默认开启降噪，详见下节。首次 GPU 初始化/内核编译仍可能等待，旋转视角仍会重新采样。
 脚本不调用“保存偏好设置”：后端选择影响当前 Blender 进程的 Cycles 偏好；场景设备会随 `.blend` 保存，但在另一个进程重新打开时仍建议同时运行脚本以检测本机 GPU。
 可在 Blender 渲染属性中手动改回 CPU；定时刷新不会覆盖它，重新运行脚本则再次优先选择 GPU。
 
 验证记录见 `outputs/gpu_render_verification.json`（含脚本 SHA-256）。同一演示、1280 x 820、32 采样并开启最终降噪，连续两次静帧实测 CPU 为 17.55 / 17.22 秒，GPU 为 5.92 / 6.38 秒，包含 PNG 输出。
 这是该次运行的静帧对照，不是视口旋转 FPS 或稳定性能保证。显存占用、驱动、初次缓存和其他程序负载都会影响结果；GPU 渲染失败或显存不足不会被静默重试成 CPU。
 受限测试环境无法写入默认 OptiX 缓存目录时，驱动会回退到项目内的 `optix7cache.db`，该缓存已忽略，不进入 Git。
+
+### 视口降噪
+
+原视口只有 12 次采样且未开启降噪，GPU 加速本身不会去掉采样颗粒。新版启动或重新连接时启用视口降噪：当前使用 OptiX GPU 时明确选择 OptiX，其他设备使用 Blender 的 AUTO；从第 1 个样本开始允许降噪。
+此改动不增加现有采样数，不改变最终渲染的采样、降噪、球体材质或投影 RGB。当前场景可直接重连，不需要 `--rebuild`。
+在“体积投影”侧栏取消“视口降噪”可以即时查看原始效果；自动刷新不会重新勾选，但下次运行脚本会恢复开启。开关随 `.blend` 保存。
+降噪是图像估计，可能让很细的边缘变柔，不能承诺所有缩放和姿态下都保留亚像素小球；精确检查时可临时关闭。旋转时仍会重采样，并有降噪计算开销，不保证帧率提升。
+验证使用相同 12 采样静帧作为视口的近似对照：高饱和彩色像素保留约 99.1%，归一化 RGB 平均误差约 0.0062；地面局部高频指标明显下降。这不是逐球可见率或实际视口性能测量。已在当前未保存场景中重连并目视检查采样完成后的视口：地面和接收屏颗粒减少，彩色点仍可见，保留原有视角及光线显示状态；未测量交互 FPS。
+对照及指标输出在 `tmp/denoise_render/`，该目录不纳入 Git；重新运行下面的专项测试即可复现。
 
 1. 运行脚本，打开“体积投影”侧栏，默认测试图会由镜头处的 `Projector_Image_Light` 投射到后方接收屏。
 2. 点击“加载投影图片”，选择 PNG/JPG 等静态图像。图片会打包到 `.blend`，投影灯和气泡采样使用同一份图像。
@@ -195,6 +205,7 @@ CSV 的 `pixel_*_calibrated` 是最近一次点云生成时的索引，`pixel_*_
 ```powershell
 & 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_projection_blender.py
 & 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_optical_render_blender.py
+& 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_denoise_render_blender.py
 ```
 
 测试覆盖初始像素映射、有限气泡与其他中心射线的分离、玻璃内部边界、投影仪变换、
@@ -205,7 +216,7 @@ CSV 的 `pixel_*_calibrated` 是最近一次点云生成时的索引，`pixel_*_
 隐藏光线版本通过 29 项功能测试，覆盖隐藏/恢复、照明不变、自动刷新及旧场景兼容检查。
 玻璃简化新增默认材质、镜头隔离及旧场景转换检查；渲染测试新增反射光路隔离探针与透射保留探针。
 纯颜色版本新增直接 RGB 显示、旧散射比例无效、旧场景移除散射但保留用户灯光，以及导出模型标识检查。
-当前版本在 Blender 5.2.1 LTS 下通过 37 项功能测试和 5 组 OptiX 渲染检查（共 6 次小尺寸渲染），包含跨场景迁移保护、实际 GPU 选择、无 GPU 时回退 CPU，以及重新连接时保留场景与采样设置。
+当前版本在 Blender 5.2.1 LTS 下通过 39 项功能测试、5 组 OptiX 渲染检查（6 次小尺寸渲染），以及 1 组 12 采样降噪对照（2 次 1280 x 820 渲染）。包含跨场景迁移保护、GPU 选择、CPU 回退、视口降噪设置与采样保留。降噪专项测试需要 OptiX 设备，无设备会明确失败而非伪称通过。
 渲染级检查会将隔离场景输出到 `tmp/optical_render/`，验证四象限方向、全部光源关闭后屏幕变黑，以及有颜色的球体不会照亮屏幕；同时验证玻璃无反射且保留透射。
 
 ## 使用排查与溯源

@@ -309,12 +309,34 @@ class OpticalTests(unittest.TestCase):
         points = [(o.as_pointer(), tuple(o.location)) for o in self.scene.objects if o.get("vp_role") == "bubble"]
         self.scene.cycles.samples = 47
         self.scene.cycles.preview_samples = 9
+        self.scene.cycles.use_preview_denoising = False
         projection.main()
         self.assertIn("vp_render_backend", self.scene)
         self.assertEqual(self.body.matrix_world, pose)
         self.assertEqual(points, [(o.as_pointer(), tuple(o.location)) for o in self.scene.objects if o.get("vp_role") == "bubble"])
         self.assertEqual(self.scene.cycles.samples, 47)
         self.assertEqual(self.scene.cycles.preview_samples, 9)
+        self.assertTrue(self.scene.cycles.use_preview_denoising)
+        self.scene.cycles.use_preview_denoising = False
+        projection.update_projection()
+        self.assertFalse(self.scene.cycles.use_preview_denoising)
+
+    def test_viewport_denoising_enabled_without_increasing_samples(self):
+        self.assertTrue(self.scene.cycles.use_preview_denoising)
+        self.assertEqual(self.scene.cycles.preview_samples, 12)
+        self.assertEqual(self.scene.cycles.samples, 32)
+        self.assertEqual(self.scene.cycles.preview_denoising_start_sample, 1)
+        if self.scene["vp_render_backend"] == "OPTIX":
+            self.assertEqual(self.scene.cycles.preview_denoiser, "OPTIX")
+
+    def test_viewport_denoising_uses_auto_without_optix(self):
+        self.assertTrue(hasattr(projection, "configure_viewport_denoising"))
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+        with patch.object(type(prefs), "get_devices_for_type", return_value=[]):
+            projection.configure_cycles_device()
+        projection.configure_viewport_denoising()
+        self.assertTrue(self.scene.cycles.use_preview_denoising)
+        self.assertEqual(self.scene.cycles.preview_denoiser, "AUTO")
 
     def test_textured_spot_tracks_lens_and_power(self):
         self.assertTrue(hasattr(projection, "update_optical_projection"))

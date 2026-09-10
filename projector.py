@@ -866,6 +866,23 @@ def configure_cycles_device():
     return "CPU"
 
 
+def configure_viewport_denoising():
+    scene = bpy.context.scene
+    if scene.render.engine != "CYCLES":
+        return
+    cycles = scene.cycles
+    addon = bpy.context.preferences.addons.get("cycles")
+    use_optix = (cycles.device == "GPU" and addon is not None
+                 and addon.preferences.compute_device_type == "OPTIX")
+    try:
+        cycles.preview_denoiser = "OPTIX" if use_optix else "AUTO"
+    except (TypeError, ValueError, RuntimeError):
+        cycles.preview_denoiser = "AUTO"
+    cycles.use_preview_denoising = True
+    cycles.preview_denoising_start_sample = 1
+    log_step(f"视口降噪: {cycles.preview_denoiser}，采样上限保持 {cycles.preview_samples}。")
+
+
 def setup_scene(camera_target: Vector) -> Vector:
     scene = bpy.context.scene
     scene.unit_settings.system = "METRIC"
@@ -884,6 +901,7 @@ def setup_scene(camera_target: Vector) -> Vector:
         scene.cycles.preview_samples = 12
         scene.cycles.use_denoising = True
         configure_cycles_device()
+        configure_viewport_denoising()
 
     try:
         scene.view_settings.view_transform = "Filmic"
@@ -1790,6 +1808,7 @@ class VP_PT_controls(bpy.types.Panel):
         if scene.render.engine == "CYCLES":
             backend = bpy.context.preferences.addons["cycles"].preferences.compute_device_type
             layout.label(text=f"Cycles: {scene.cycles.device} / {backend}")
+            layout.prop(scene.cycles, "use_preview_denoising", text="视口降噪")
         layout.prop(scene, '["vp_flux_w"]', text="光源功率 (W)")
         layout.prop(scene, '["vp_show_receiver"]', text="接收屏")
         layout.label(text=f"照亮 {scene.get('vp_lit_count', 0)} / {scene.get('vp_total_count', 0)}")
@@ -1918,6 +1937,7 @@ def main() -> None:
             log_step("保留已有场景和投影仪位置，重新连接投影控制。")
             update_projection()
             configure_cycles_device()
+            configure_viewport_denoising()
         else:
             scene_data = build_scene()
         register_projection_controls()
