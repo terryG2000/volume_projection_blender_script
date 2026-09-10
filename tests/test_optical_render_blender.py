@@ -88,6 +88,7 @@ glass_material = scene.objects[scene["vp_volume"]].data.materials[0]
 scene = bpy.data.scenes.new("Glass_Reflection_Probe")
 bpy.context.window.scene = scene
 scene.render.engine = "CYCLES"
+p.configure_cycles_device()
 scene.render.resolution_x = scene.render.resolution_y = 64
 scene.render.resolution_percentage = 100
 scene.render.image_settings.file_format = "PNG"

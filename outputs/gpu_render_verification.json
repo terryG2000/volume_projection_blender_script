@@ -1,0 +1,22 @@
+{
+  "backend": "OPTIX",
+  "devices": "NVIDIA GeForce RTX 3070 Ti Laptop GPU",
+  "source_sha256": "593d2c4f69214c4384e668db56afe155c850621c561c9505078709c680c69424",
+  "resolution": [
+    1280,
+    820
+  ],
+  "samples": 32,
+  "denoising": true,
+  "seconds_first_then_repeat": {
+    "CPU": [
+      17.545183099995484,
+      17.215431199991144
+    ],
+    "GPU": [
+      5.917195300004096,
+      6.380414999992354
+    ]
+  },
+  "scope": "Same saved scene, final still render including PNG output; not viewport orbit FPS."
+}

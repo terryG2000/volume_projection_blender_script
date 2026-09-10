@@ -834,6 +834,38 @@ def create_laser_written_guides(
 
 # ========== 场景布置 ==========
 
+def configure_cycles_device():
+    scene = bpy.context.scene
+    addon = bpy.context.preferences.addons.get("cycles")
+    if addon is not None:
+        preferences = addon.preferences
+        supported = {item[0] for item in preferences.get_device_types(bpy.context)}
+        for backend in ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL"):
+            if backend not in supported:
+                continue
+            try:
+                devices = preferences.get_devices_for_type(backend)
+                gpu_names = [device.name for device in devices if device.type == backend]
+                if not gpu_names:
+                    continue
+                preferences.compute_device_type = backend
+                for device in devices:
+                    device.use = device.type == backend
+                scene.cycles.device = "GPU"
+                scene["vp_render_backend"] = backend
+                scene["vp_render_devices"] = ", ".join(gpu_names)
+                log_step(f"Cycles GPU / {backend}: {scene['vp_render_devices']}")
+                return backend
+            except (TypeError, ValueError, RuntimeError) as exc:
+                log_step(f"GPU 后端 {backend} 不可用: {exc}")
+    if hasattr(scene, "cycles"):
+        scene.cycles.device = "CPU"
+    scene["vp_render_backend"] = "CPU"
+    scene["vp_render_devices"] = "CPU"
+    log_step("未检测到兼容的 Cycles GPU，回退到 CPU。")
+    return "CPU"
+
+
 def setup_scene(camera_target: Vector) -> Vector:
     scene = bpy.context.scene
     scene.unit_settings.system = "METRIC"
@@ -851,6 +883,7 @@ def setup_scene(camera_target: Vector) -> Vector:
         scene.cycles.samples = 32
         scene.cycles.preview_samples = 12
         scene.cycles.use_denoising = True
+        configure_cycles_device()
 
     try:
         scene.view_settings.view_transform = "Filmic"
@@ -1754,6 +1787,9 @@ class VP_PT_controls(bpy.types.Panel):
         if scene.get("vp_source_image"):
             layout.label(text=scene["vp_source_image"], icon="IMAGE_DATA")
         layout.prop(scene, '["vp_optics"]', text="图像光照 / Cycles")
+        if scene.render.engine == "CYCLES":
+            backend = bpy.context.preferences.addons["cycles"].preferences.compute_device_type
+            layout.label(text=f"Cycles: {scene.cycles.device} / {backend}")
         layout.prop(scene, '["vp_flux_w"]', text="光源功率 (W)")
         layout.prop(scene, '["vp_show_receiver"]', text="接收屏")
         layout.label(text=f"照亮 {scene.get('vp_lit_count', 0)} / {scene.get('vp_total_count', 0)}")
@@ -1881,6 +1917,7 @@ def main() -> None:
             scene_data = {}
             log_step("保留已有场景和投影仪位置，重新连接投影控制。")
             update_projection()
+            configure_cycles_device()
         else:
             scene_data = build_scene()
         register_projection_controls()

@@ -272,6 +272,50 @@ class OpticalTests(unittest.TestCase):
         self.scene = bpy.context.scene
         self.body = projection.projection_body()
 
+    def test_gpu_configuration_uses_available_device(self):
+        self.assertTrue(hasattr(projection, "configure_cycles_device"))
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+        supported = {item[0] for item in prefs.get_device_types(bpy.context)}
+        available = []
+        for backend in ("OPTIX", "CUDA", "HIP", "ONEAPI", "METAL"):
+            if backend in supported:
+                devices = prefs.get_devices_for_type(backend)
+                if any(d.type == backend for d in devices):
+                    available.append(backend)
+                    break
+        if not available:
+            self.skipTest("No supported GPU on this host")
+        projection.configure_cycles_device()
+        self.assertEqual(prefs.compute_device_type, available[0])
+        self.assertEqual(self.scene.cycles.device, "GPU")
+        devices = prefs.get_devices_for_type(available[0])
+        self.assertTrue(all(d.use for d in devices if d.type == available[0]))
+        self.assertTrue(all(not d.use for d in devices if d.type == "CPU"))
+
+    def test_gpu_unavailable_falls_back_to_cpu(self):
+        self.assertTrue(hasattr(projection, "configure_cycles_device"))
+        prefs = bpy.context.preferences.addons["cycles"].preferences
+        with patch.object(type(prefs), "get_devices_for_type", return_value=[]):
+            projection.configure_cycles_device()
+        self.assertEqual(self.scene.cycles.device, "CPU")
+        self.assertEqual(self.scene["vp_render_backend"], "CPU")
+
+    def test_device_reconnect_preserves_scene_and_sampling(self):
+        self.assertTrue(hasattr(projection, "configure_cycles_device"))
+        self.scene["vp_freeze_points"] = True
+        self.body.location.x += 0.1
+        projection.update_projection()
+        pose = self.body.matrix_world.copy()
+        points = [(o.as_pointer(), tuple(o.location)) for o in self.scene.objects if o.get("vp_role") == "bubble"]
+        self.scene.cycles.samples = 47
+        self.scene.cycles.preview_samples = 9
+        projection.main()
+        self.assertIn("vp_render_backend", self.scene)
+        self.assertEqual(self.body.matrix_world, pose)
+        self.assertEqual(points, [(o.as_pointer(), tuple(o.location)) for o in self.scene.objects if o.get("vp_role") == "bubble"])
+        self.assertEqual(self.scene.cycles.samples, 47)
+        self.assertEqual(self.scene.cycles.preview_samples, 9)
+
     def test_textured_spot_tracks_lens_and_power(self):
         self.assertTrue(hasattr(projection, "update_optical_projection"))
         spot = self.scene.objects[self.scene["vp_spot"]]

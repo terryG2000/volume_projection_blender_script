@@ -4,3 +4,4 @@ tmp/
 outputs/*.blend
 outputs/*.blend1
 outputs/*.log
+optix7cache.db*
