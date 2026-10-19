@@ -18,11 +18,17 @@ import json
 import hashlib
 import time
 import sys
+import importlib.util
+import base64
+import gzip
+import textwrap
 from pathlib import Path
 from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 import bpy
 from mathutils import Matrix, Vector
+from mathutils.kdtree import KDTree
+from bpy.app.handlers import persistent
 
 
 # ========== 场景参数 ==========
@@ -60,6 +66,116 @@ PREVIEW_BLEND_PATH = OUTPUT_DIR / "volume_projection_scene.blend"
 # ========== 通用工具 ==========
 
 Color = Tuple[float, float, float, float]
+_animation_cache = {}
+_animation_module = None
+_animation_updating = False
+
+
+def animation_module():
+    global _animation_module
+    if _animation_module is None:
+        spec = importlib.util.spec_from_file_location(
+            "vp_point_animation", Path(__file__).resolve().with_name("point_cloud_animation.py"))
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        _animation_module = module
+    return _animation_module
+
+
+def load_point_animation(filepath):
+    data = animation_module().read(bpy.path.abspath(filepath))
+    scene = bpy.context.scene
+    if projection_body() is None:
+        raise ValueError("请先生成投影场景")
+    text = bpy.data.texts.new("ProjectionPointAnimation.json.gz.b64")
+    packed = gzip.compress(json.dumps(data, separators=(",", ":")).encode("utf-8"), mtime=0)
+    text.write(textwrap.fill(base64.b64encode(packed).decode("ascii"), width=120))
+    scene["vp_animation_text"] = text.name
+    scene["vp_animation_path"] = str(filepath)
+    scene["vp_animation_radius"] = 0.14
+    scene.id_properties_ui("vp_animation_radius").update(min=0.005, max=0.5)
+    scene["vp_animation_loop"] = True
+    scene["vp_content"] = "ANIMATION"
+    scene.frame_start, scene.frame_end = 1, len(data["frames"])
+    scene.render.fps = math.ceil(data["fps"])
+    scene.render.fps_base = scene.render.fps / data["fps"]
+    scene.render.use_lock_interface = True
+    _animation_cache.clear()
+    _animation_cache.update(key=(text.name, text.as_pointer()), data=data)
+    scene.frame_set(1)
+    update_projection()
+
+
+def point_animation_frame(scene, body):
+    text = bpy.data.texts.get(scene.get("vp_animation_text", ""))
+    if text is None:
+        raise ValueError("动画数据缺失，请重新导入点云 JSON")
+    key = (text.name, text.as_pointer())
+    if _animation_cache.get("key") != key:
+        packed = base64.b64decode(text.as_string())
+        data = animation_module().validate(json.loads(gzip.decompress(packed)))
+        _animation_cache.clear()
+        _animation_cache.update(key=key, data=data)
+    data = _animation_cache["data"]
+    # Timeline FPS can be changed without changing the clip's physical duration.
+    elapsed = (scene.frame_current + scene.frame_subframe - scene.frame_start) / (scene.render.fps / scene.render.fps_base)
+    index = math.floor(elapsed * data["fps"] + 1e-6)
+    index = index % len(data["frames"]) if scene.get("vp_animation_loop", True) else max(0, min(len(data["frames"]) - 1, index))
+    points = data["frames"][index]["points"]
+    if _animation_cache.get("index") != index:
+        tree = KDTree(len(points))
+        for i, point in enumerate(points):
+            tree.insert(point[:3], i)
+        tree.balance()
+        _animation_cache.update(index=index, tree=tree)
+    tree = _animation_cache["tree"]
+    nx, nz = body["vp_grid"]
+    frame = {(x, z): (0.0, 0.0, 0.0, 1.0) for x in range(nx) for z in range(nz)}
+    volume = scene.objects[scene["vp_volume"]]
+    half_extent = min(volume.dimensions) / 2
+    if half_extent <= 1e-8:
+        raise ValueError("玻璃尺寸必须非零")
+    local_center = sum((Vector(p) for p in volume.bound_box), Vector()) / 8
+    center = volume.matrix_world @ local_center
+    rotation = volume.matrix_world.to_quaternion().inverted()
+    radius = max(0.005, min(0.5, float(scene.get("vp_animation_radius", 0.14))))
+    contributors = {}
+    for bubble in (o for o in scene.objects if o.get("vp_role") == "bubble"):
+        pixel = project_to_pixel(body, bubble.matrix_world.translation)
+        if pixel is None:
+            continue
+        pixel = tuple(math.floor(v + 0.5) for v in pixel)
+        contributors[pixel] = contributors.get(pixel, 0) + 1
+        if not points:
+            continue
+        position = rotation @ (bubble.matrix_world.translation - center) / half_extent
+        _, nearest, distance = tree.find(position)
+        if distance <= radius:
+            rgb = points[nearest][3:]
+            # One projector pixel cannot independently address multiple depths.
+            frame[pixel] = tuple(max(a, b) for a, b in zip(frame[pixel][:3], rgb)) + (1.0,)
+    scene["vp_animation_frame"] = index + 1
+    scene["vp_animation_count"] = len(data["frames"])
+    scene["vp_animation_conflicts"] = sum(n - 1 for n in contributors.values())
+    return frame
+
+
+@persistent
+def point_animation_changed(scene, depsgraph=None):
+    global _animation_updating
+    if _animation_updating or scene.get("vp_content") != "ANIMATION":
+        return
+    _animation_updating = True
+    try:
+        with bpy.context.temp_override(scene=scene, view_layer=scene.view_layers[0]):
+            update_projection()
+    except Exception as exc:
+        scene["vp_animation_error"] = str(exc)
+        log_step(f"动画帧更新失败: {exc}")
+    else:
+        scene["vp_animation_error"] = ""
+    finally:
+        _animation_updating = False
 
 
 def set_input(node, names: Sequence[str], value) -> bool:
@@ -1540,6 +1656,8 @@ def sample_projection_color(body, sample, frame, image_data):
 def projection_frame(scene, body, image_data=None):
     nx, nz = body["vp_grid"]
     mode = scene.get("vp_content", "TEST")
+    if mode == "ANIMATION":
+        return point_animation_frame(scene, body)
     image_data = image_data if image_data is not None else projection_image_data(scene)
     depths = {(obj["pixel_x"], obj["pixel_z"]): obj["depth_fraction"]
               for obj in scene.objects if obj.get("vp_role") == "bubble"}
@@ -1689,6 +1807,7 @@ def live_projection_tick():
     signature = (scene.as_pointer(), tuple(value for row in body.matrix_world for value in row),
                  parameters,
                  body.get("power", 1.0), scene.get("vp_content"),
+                 scene.get("vp_animation_radius"), scene.get("vp_animation_loop"),
                  tuple(scene.get(key) for key in OPTICAL_KEYS),
                  tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_image", "vp_show_layers",
                                                   "vp_hide_ray_geometry")),
@@ -1727,9 +1846,12 @@ class VP_OT_content(bpy.types.Operator):
     bl_idname = "vp.content"
     bl_label = "投影内容"
     bl_options = {"REGISTER", "UNDO"}
-    mode: bpy.props.EnumProperty(items=[("TEST", "测试图", ""), ("COLOR_BARS", "彩条", ""), ("WHITE", "全白", ""), ("DEPTH", "深度编码", ""), ("IMAGE", "图片", "")])
+    mode: bpy.props.EnumProperty(items=[("TEST", "测试图", ""), ("COLOR_BARS", "彩条", ""), ("WHITE", "全白", ""), ("DEPTH", "深度编码", ""), ("IMAGE", "图片", ""), ("ANIMATION", "点云动画", "")])
 
     def execute(self, context):
+        if self.mode == "ANIMATION" and not bpy.data.texts.get(context.scene.get("vp_animation_text", "")):
+            self.report({"WARNING"}, "请先导入点云动画")
+            return {"CANCELLED"}
         if self.mode == "IMAGE" and bpy.data.images.get(context.scene.get("vp_source_image", "")) is None:
             self.report({"WARNING"}, "请先加载投影图片")
             return {"CANCELLED"}
@@ -1771,6 +1893,74 @@ class VP_OT_load_image(bpy.types.Operator):
         return {"FINISHED"}
 
 
+class VP_OT_load_animation(bpy.types.Operator):
+    bl_idname = "vp.load_animation"
+    bl_label = "导入点云动画"
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH")
+    filter_glob: bpy.props.StringProperty(default="*.json", options={"HIDDEN"})
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        try:
+            load_point_animation(self.filepath)
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class VP_OT_export_animation(bpy.types.Operator):
+    bl_idname = "vp.export_animation"
+    bl_label = "导出选中网格动画"
+    filepath: bpy.props.StringProperty(subtype="FILE_PATH", default="point_animation.json")
+    filter_glob: bpy.props.StringProperty(default="*.json", options={"HIDDEN"})
+    samples: bpy.props.IntProperty(name="每帧表面采样数", default=2048, min=1, max=20000)
+
+    def invoke(self, context, event):
+        context.window_manager.fileselect_add(self)
+        return {"RUNNING_MODAL"}
+
+    def execute(self, context):
+        try:
+            animation_module().export_animation(bpy.path.abspath(self.filepath), context.scene,
+                                                list(context.selected_objects), self.samples)
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        self.report({"INFO"}, "已导出点云动画；源场景当前帧已恢复")
+        return {"FINISHED"}
+
+
+class VP_OT_cube_animation(bpy.types.Operator):
+    bl_idname = "vp.cube_animation"
+    bl_label = "旋转立方体测试"
+
+    def execute(self, context):
+        try:
+            source, cube = animation_module().create_rotating_cube()
+            path = OUTPUT_DIR / "rotating_cube.pointcloud.json"
+            animation_module().export_animation(path, source, [cube], 1200)
+            load_point_animation(str(path))
+        except (ValueError, RuntimeError, OSError) as exc:
+            self.report({"ERROR"}, str(exc))
+            return {"CANCELLED"}
+        return {"FINISHED"}
+
+
+class VP_PT_animation_export(bpy.types.Panel):
+    bl_label = "动画点云导出"
+    bl_idname = "VP_PT_animation_export"
+    bl_space_type = "VIEW_3D"
+    bl_region_type = "UI"
+    bl_category = "体积投影"
+
+    def draw(self, context):
+        self.layout.operator("vp.export_animation", icon="EXPORT")
+
+
 class VP_PT_controls(bpy.types.Panel):
     bl_label = "体积投影"
     bl_idname = "VP_PT_controls"
@@ -1800,8 +1990,21 @@ class VP_PT_controls(bpy.types.Panel):
         layout.separator()
         layout.prop(body, '["power"]', text="相对强度")
         layout.prop(scene, '["vp_auto"]', text="自动更新")
-        layout.operator_menu_enum("vp.content", "mode", text={"TEST": "测试图", "COLOR_BARS": "彩条", "WHITE": "全白", "DEPTH": "深度编码", "IMAGE": "图片"}.get(scene.get("vp_content"), "投影内容"))
+        layout.operator_menu_enum("vp.content", "mode", text={"TEST": "测试图", "COLOR_BARS": "彩条", "WHITE": "全白", "DEPTH": "深度编码", "IMAGE": "图片", "ANIMATION": "点云动画"}.get(scene.get("vp_content"), "投影内容"))
         layout.operator("vp.load_image", icon="IMAGE_DATA")
+        layout.operator("vp.load_animation", icon="IMPORT")
+        layout.operator("vp.cube_animation", icon="MESH_CUBE")
+        if scene.get("vp_animation_text"):
+            layout.prop(scene, '["vp_animation_radius"]', text="点云匹配半径")
+            layout.prop(scene, '["vp_animation_loop"]', text="动画循环")
+            layout.label(text=f"动画帧 {scene.get('vp_animation_frame', 1)} / {scene.get('vp_animation_count', 0)}")
+            layout.label(text=f"共像素气泡冲突: {scene.get('vp_animation_conflicts', 0)}")
+            if scene.get("vp_animation_error"):
+                layout.label(text=scene["vp_animation_error"], icon="ERROR")
+            row = layout.row(align=True)
+            row.operator("screen.frame_jump", text="", icon="REW").end = False
+            row.operator("screen.animation_play", text="", icon="PAUSE" if context.screen.is_animation_playing else "PLAY")
+            layout.prop(scene, "frame_current", text="时间轴帧")
         if scene.get("vp_source_image"):
             layout.label(text=scene["vp_source_image"], icon="IMAGE_DATA")
         layout.prop(scene, '["vp_optics"]', text="图像光照 / Cycles")
@@ -1828,12 +2031,19 @@ def register_projection_controls():
     callback = runtime.get("timer")
     if callback and bpy.app.timers.is_registered(callback):
         bpy.app.timers.unregister(callback)
+    handler = runtime.get("frame_handler")
+    if handler in bpy.app.handlers.frame_change_post:
+        bpy.app.handlers.frame_change_post.remove(handler)
     for cls in reversed(runtime.get("classes", [])):
         bpy.utils.unregister_class(cls)
-    classes = (VP_OT_update, VP_OT_restore, VP_OT_content, VP_OT_export, VP_OT_load_image, VP_PT_controls)
+    classes = (VP_OT_update, VP_OT_restore, VP_OT_content, VP_OT_export, VP_OT_load_image,
+               VP_OT_load_animation, VP_OT_export_animation, VP_OT_cube_animation,
+               VP_PT_animation_export, VP_PT_controls)
     for cls in classes:
         bpy.utils.register_class(cls)
-    bpy._volume_projection_runtime = {"timer": live_projection_tick, "classes": classes}
+    bpy.app.handlers.frame_change_post.append(point_animation_changed)
+    bpy._volume_projection_runtime = {"timer": live_projection_tick, "classes": classes,
+                                      "frame_handler": point_animation_changed}
     if not bpy.app.background:
         bpy.app.timers.register(live_projection_tick, first_interval=0.15, persistent=True)
 

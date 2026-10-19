@@ -6,7 +6,10 @@
 
 ## 项目文件
 
-- `projector.py`：唯一的模型运行入口，包含建模、材质、光线映射和侧栏控制；不依赖本地 `classes` 或 `utils` 包。
+- `projector.py`：主要模型运行入口，包含建模、材质、光线映射和侧栏控制；不依赖本地 `classes` 或 `utils` 包。
+- `point_cloud_animation.py`：动画网格采样、版本化 JSON 校验及旋转立方体源动画。动画功能需要它与 `projector.py` 位于同一目录。
+- `demo_rotating_cube.py`：独立生成并播放旋转立方体投影测试，不修改其他 Blender 进程中的场景。
+- `tests/test_animation_blender.py`：动画导出、导入、时间轴、变形网格和颜色映射回归。
 - `tests/test_projection_blender.py`：Blender 回归测试。
 - `tests/test_optical_render_blender.py`：实际渲染验证，检查 RGB 方向、关灯响应、球体不照亮其他物体和玻璃透射。
 - `tests/test_denoise_render_blender.py`：OptiX 下 12 采样的降噪前后对照，检查地面颗粒与高饱和像素保留。
@@ -61,6 +64,52 @@
 所有面板参数保存在 `.blend` 中，重复运行脚本保留参数。`--rebuild` 用于从脚本默认值重建整个演示。
 
 ## 图像投影与球体取色
+
+### 三维动画转点云与播放
+
+一键运行旋转立方体测试（新窗口保留，自动开始播放）：
+
+```powershell
+& 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --python demo_rotating_cube.py
+```
+
+示例创建独立的 `RotatingCubeSource` 源动画和 `VolumeProjection` 投影场景，六个面使用不同颜色，48 帧、24 FPS、每帧 1200 个表面样本。投影场景使用 32 x 24 个固定显示点；点云匹配半径为 0.18。
+生成文件为 `outputs/rotating_cube.pointcloud.json` 和 `outputs/rotating_cube_projection.blend`。它们是可重新生成的实验产物，不纳入 Git；JSON 的 `source` 记录源提交、工作树是否修改及导出器 SHA256。
+加 `--background --python-exit-code 1` 并在脚本后传入 `-- --render-preview`，可后台生成第 1、13 帧的 PNG 对照；后台模式不会保留窗口。
+
+打开保存的测试场景并重新连接播放控制：
+
+```powershell
+& 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' outputs/rotating_cube_projection.blend --python projector.py -- --keep-open
+```
+
+重新打开不会自动执行嵌入脚本；需要上面的 `--python` 重连。数据已压缩打包在 `.blend` 的 Text 数据块中，播放不依赖原 JSON 路径。不要直接编辑打包文本，修改数据后重新导入 JSON。
+
+导出自己的 Blender 动画：
+
+1. 在动画文件中运行 `projector.py` 注册面板。它会创建独立投影场景，原动画场景仍保留；在顶部场景选择器切回原动画场景。
+2. 选中需要转换的 Mesh 对象，设置时间轴开始、结束帧及场景 FPS。
+3. 在“体积投影 → 动画点云导出”点击“导出选中网格动画”，选择 JSON 路径和每帧表面采样数。完成后恢复源场景原来的帧及子帧。
+4. 切回 `VolumeProjection`，点击“导入点云动画”。导入会将目标时间轴设为 1 到动画帧数，设置源 FPS 并跳到第 1 帧，不修改投影仪位置、点数或固定点模式。
+5. 点击播放/暂停按钮，或拖动时间轴逐帧查看。“点云匹配半径”控制表面厚度，过小会漏点，过大会让轮廓变厚；返回测试图或图片模式可停止使用动画颜色。
+
+已有投影场景中也可以点击“旋转立方体测试”，生成 JSON 并导入；该按钮保留原有点数和视角，只切换内容与时间轴。默认 16 x 10 点较稀疏，可手动提高点数；一键演示脚本只在独立演示中使用 32 x 24。
+
+**映射规则与限制**
+
+- 导出逐帧求值后的网格，包含对象变换和已求值的形态键/网格修改器；对三角面按世界空间面积进行确定性采样。仅采样选中的 Mesh，不遍历实例；Geometry Nodes 实例应先 Realize Instances，曲线/文字应先转为 Mesh。
+- 用整段动画共用的包围盒进行一次等比例归一化到约 `[-0.8, 0.8]`，保留相对运动和大小，不逐帧居中。绝对世界位置与单位不直接送入玻璃，原始中心和缩放记录在元数据中。
+- RGB 是线性颜色，来自材质的 Viewport Display/Diffuse Color，缺少材质时使用对象颜色。不烘焙节点、纹理、灯光或透明度；带贴图的模型必须先另行烘焙/转换颜色，此版本不宣称复现完整渲染外观。
+- 导入的目标点云按玻璃最短边等比例居中放置。用 KDTree 查询气泡到最近目标表面样本的距离；半径是相对于玻璃最短半边长的比例。匹配后生成每个投影像素的 RGB，气泡、真实投影灯纹理与实体光线共用此帧。
+- 播放不移动气泡，也不把动画点直接伪装成可独立寻址的显示点。手动移动投影仪仍遵守原有设计/固定点模式。多气泡落入同一投影像素时按 RGB 分量最大值合并，它们会显示相同颜色，面板报告冲突数；单台投影仪不能在同一光线上独立控制不同深度。
+- 这是稀疏体积表面近似，不是连续实体或完整光学仿真。轮廓受气泡布局、点数、匹配半径和视角限制；源点增多不等于实际显示像素增多。
+- 使用时间轴 FPS 换算源帧，逐帧取样、不插值；开启循环时取模，关闭时超出范围保持首/尾帧。Blender 自身的时间轴循环仍由播放范围决定，取消此开关不会自动停止时间轴。修改目标 FPS 后需要自行调整播放结束帧。
+- 导入最多 64 MiB、2000 帧、总计 500000 个点；导出每帧 1..20000 个点且同样限制总数。空帧显示黑色；格式版本、有限数值、坐标和颜色范围均进行校验。导出会同步计算全部帧，大任务会暂时占用 UI。
+- 动画由 `frame_change_post` 驱动，渲染也更新帧；导入时开启 Render Lock Interface，避免渲染线程与界面同时访问被修改的数据，依据 [Blender 官方 handler 说明](https://docs.blender.org/api/5.2/bpy.app.handlers.html)。不保证 Cycles 实时达到源 FPS。
+
+**JSON v1**：`format="volume_projection_point_animation"`、`version=1`、`coordinates="normalized_isotropic"`、`color_space="linear_rgb"`、`fps`、`frames=[{"source_frame":1,"points":[[x,y,z,r,g,b], ...]}, ...]`；帧数组顺序决定播放顺序，`source_frame` 仅用于溯源。普通投影仪不能直接读取此 JSON，需先导入模拟器映射为二维图像；现有“导出坐标和投影图”导出当前帧的投影 PNG。
+
+本次在 Blender 5.2.1 LTS 下通过 39 项旧回归与 11 项动画回归，包括时间轴循环/FPS、形态键、固定点不移动、纹理 RGB 一致、共像素冲突、非法输入、空帧、重复注册及打包缓存重载。原有光学及降噪渲染检查通过，两帧 Cycles 预览已生成并目视检查。保存的场景在独立进程重新打开后成功切到第 13 帧，248 个点被照亮，无动画错误。未测量实际播放 FPS。
 
 本分支默认使用 Cycles，启动后进入渲染视图；初次着色和采样需要等待。材质预览模式不能作为图像灯光的验证结果。
 
@@ -206,6 +255,7 @@ CSV 的 `pixel_*_calibrated` 是最近一次点云生成时的索引，`pixel_*_
 & 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_projection_blender.py
 & 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_optical_render_blender.py
 & 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_denoise_render_blender.py
+& 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_animation_blender.py
 ```
 
 测试覆盖初始像素映射、有限气泡与其他中心射线的分离、玻璃内部边界、投影仪变换、
@@ -216,7 +266,7 @@ CSV 的 `pixel_*_calibrated` 是最近一次点云生成时的索引，`pixel_*_
 隐藏光线版本通过 29 项功能测试，覆盖隐藏/恢复、照明不变、自动刷新及旧场景兼容检查。
 玻璃简化新增默认材质、镜头隔离及旧场景转换检查；渲染测试新增反射光路隔离探针与透射保留探针。
 纯颜色版本新增直接 RGB 显示、旧散射比例无效、旧场景移除散射但保留用户灯光，以及导出模型标识检查。
-当前版本在 Blender 5.2.1 LTS 下通过 39 项功能测试、5 组 OptiX 渲染检查（6 次小尺寸渲染），以及 1 组 12 采样降噪对照（2 次 1280 x 820 渲染）。包含跨场景迁移保护、GPU 选择、CPU 回退、视口降噪设置与采样保留。降噪专项测试需要 OptiX 设备，无设备会明确失败而非伪称通过。
+当前版本在 Blender 5.2.1 LTS 下通过 39 项静态功能测试、11 项动画测试、5 组 OptiX 渲染检查（6 次小尺寸渲染），以及 1 组 12 采样降噪对照（2 次 1280 x 820 渲染）。包含跨场景迁移保护、GPU 选择、CPU 回退、视口降噪设置与采样保留。降噪专项测试需要 OptiX 设备，无设备会明确失败而非伪称通过。
 渲染级检查会将隔离场景输出到 `tmp/optical_render/`，验证四象限方向、全部光源关闭后屏幕变黑，以及有颜色的球体不会照亮屏幕；同时验证玻璃无反射且保留透射。
 
 ## 使用排查与溯源

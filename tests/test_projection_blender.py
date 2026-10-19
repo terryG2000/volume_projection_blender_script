@@ -124,7 +124,7 @@ class ProjectionTests(unittest.TestCase):
             self.assertEqual(len(bpy.context.scene.objects), count)
             self.assertAlmostEqual(body.location.x, old.x + 0.2, places=5)
             self.assertIn(marker.name, bpy.context.scene.objects)
-            self.assertEqual(len(bpy._volume_projection_runtime["classes"]), 6)
+            self.assertEqual(len(bpy._volume_projection_runtime["classes"]), 10)
         finally:
             body.location = old
             bpy.data.objects.remove(marker, do_unlink=True)
