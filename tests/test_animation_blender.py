@@ -133,6 +133,9 @@ class AnimationTests(unittest.TestCase):
         data = animation.export_animation(OUT / "deform.json", source, [cube], 600)
         widths = [max(p[0] for p in f["points"]) - min(p[0] for p in f["points"]) for f in data["frames"]]
         self.assertAlmostEqual(widths[1] / widths[0], 2, places=3)
+        mesh_widths = [max(v[0] for v in f["preview"]["vertices"]) - min(v[0] for v in f["preview"]["vertices"])
+                       for f in data["frames"]]
+        self.assertAlmostEqual(mesh_widths[1] / mesh_widths[0], 2, places=3)
 
     def test_shared_projector_pixel_cannot_get_independent_colors(self):
         bubbles = self.bubbles()
@@ -155,6 +158,62 @@ class AnimationTests(unittest.TestCase):
             animation.export_animation(OUT / "bad.json", self.source, [], 20)
         with self.assertRaises(ValueError):
             animation.export_animation(OUT / "bad.json", self.source, [self.cube], 20000)
+
+    def test_source_mesh_preview_tracks_same_frame_and_scale(self):
+        self.scene["vp_show_source_preview"] = True
+        projection.update_projection()
+        obj = self.scene.objects[self.scene["vp_source_preview_object"]]
+        before = [tuple(v.co) for v in obj.data.vertices]
+        self.assertEqual(len(obj.data.vertices), 8)
+        self.assertEqual(len(obj.data.polygons), 12)
+        self.scene.frame_set(13)
+        self.assertEqual(obj["source_frame"], 13)
+        self.assertNotEqual(before, [tuple(v.co) for v in obj.data.vertices])
+        expected = self.data["frames"][12]["preview"]
+        for actual, target in zip(obj.data.vertices, expected["vertices"]):
+            for a, b in zip(actual.co, target):
+                self.assertAlmostEqual(a, b, places=6)
+        for polygon, triangle in zip(obj.data.polygons, expected["triangles"]):
+            self.assertEqual(polygon.material_index, triangle[3])
+        volume = self.scene.objects[self.scene["vp_volume"]]
+        self.assertAlmostEqual(obj.matrix_world.to_scale().x, min(volume.dimensions) / 2, places=5)
+        self.assertFalse(obj.visible_shadow)
+
+    def test_preview_toggle_does_not_change_projection(self):
+        self.scene["vp_show_source_preview"] = True
+        projection.update_projection()
+        obj = self.scene.objects[self.scene["vp_source_preview_object"]]
+        colors = [tuple(o.color) for o in self.bubbles()]
+        self.scene["vp_show_source_preview"] = False
+        projection.update_projection()
+        self.assertTrue(obj.hide_render)
+        self.assertEqual(colors, [tuple(o.color) for o in self.bubbles()])
+        self.scene["vp_show_source_preview"] = True
+        projection.update_projection()
+        self.assertFalse(obj.hide_render)
+        self.scene["vp_content"] = "WHITE"
+        projection.update_projection()
+        self.assertTrue(obj.hide_render)
+
+    def test_legacy_clip_still_plays_without_fake_source_mesh(self):
+        legacy = dict(self.data, frames=[{"points": f["points"]} for f in self.data["frames"]])
+        path = OUT / "legacy.json"
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        projection.load_point_animation(str(path))
+        self.assertFalse(self.scene["vp_source_preview_available"])
+        obj = self.scene.objects.get(self.scene.get("vp_source_preview_object", ""))
+        if obj:
+            self.assertTrue(obj.hide_render)
+        self.scene.frame_set(13)
+        self.assertGreater(self.scene["vp_lit_count"], 0)
+
+    def test_invalid_mesh_indices_rejected(self):
+        preview = dict(self.data["frames"][0]["preview"], triangles=[[0, 1, 999999, 0]])
+        bad = dict(self.data, frames=[dict(self.data["frames"][0], preview=preview)])
+        with self.assertRaises(ValueError):
+            animation.validate(bad)
+        with self.assertRaises(ValueError):
+            animation.validate(dict(self.data, frames=[dict(self.data["frames"][0], source_frame=None)]))
 
 
 suite = unittest.defaultTestLoader.loadTestsFromTestCase(AnimationTests)

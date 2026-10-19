@@ -95,6 +95,10 @@ def load_point_animation(filepath):
     scene["vp_animation_radius"] = 0.14
     scene.id_properties_ui("vp_animation_radius").update(min=0.005, max=0.5)
     scene["vp_animation_loop"] = True
+    scene["vp_show_source_preview"] = scene.get("vp_show_source_preview", True)
+    if "vp_source_preview_offset" not in scene:
+        volume = scene.objects[scene["vp_volume"]]
+        scene["vp_source_preview_offset"] = [-float(volume.dimensions.x) - 0.6, 0.0, 0.0]
     scene["vp_content"] = "ANIMATION"
     scene.frame_start, scene.frame_end = 1, len(data["frames"])
     scene.render.fps = math.ceil(data["fps"])
@@ -122,6 +126,7 @@ def point_animation_frame(scene, body):
     index = math.floor(elapsed * data["fps"] + 1e-6)
     index = index % len(data["frames"]) if scene.get("vp_animation_loop", True) else max(0, min(len(data["frames"]) - 1, index))
     points = data["frames"][index]["points"]
+    update_source_preview(scene, data["frames"][index], index)
     if _animation_cache.get("index") != index:
         tree = KDTree(len(points))
         for i, point in enumerate(points):
@@ -158,6 +163,51 @@ def point_animation_frame(scene, body):
     scene["vp_animation_count"] = len(data["frames"])
     scene["vp_animation_conflicts"] = sum(n - 1 for n in contributors.values())
     return frame
+
+
+def update_source_preview(scene, source_frame, index):
+    preview = source_frame.get("preview")
+    scene["vp_source_preview_available"] = preview is not None
+    obj = scene.objects.get(scene.get("vp_source_preview_object", ""))
+    visible = preview is not None and bool(scene.get("vp_show_source_preview", True))
+    if not visible:
+        if obj:
+            set_visibility(obj, False)
+        return
+    if obj is None:
+        mesh = bpy.data.meshes.new("SourceAnimationPreviewMesh")
+        obj = bpy.data.objects.new("SourceAnimationPreview", mesh)
+        ensure_collection("08_Source_Animation_Preview").objects.link(obj)
+        obj["vp_generated"], obj["vp_role"] = True, "source_preview"
+        obj.visible_shadow = False
+        scene["vp_source_preview_object"] = obj.name
+    cache_key = (obj.as_pointer(), index)
+    if _animation_cache.get("preview_key") != cache_key:
+        mesh = obj.data
+        mesh.clear_geometry()
+        mesh.from_pydata(preview["vertices"], [], [tri[:3] for tri in preview["triangles"]])
+        for i, rgb in enumerate(preview["colors"]):
+            if i >= len(mesh.materials):
+                mat = camera_only_material("Mat_Source_Preview", 1.0)
+                emission = next(n for n in mat.node_tree.nodes if n.type == "EMISSION")
+                mat.node_tree.links.remove(emission.inputs["Color"].links[0])
+                mesh.materials.append(mat)
+            mat = mesh.materials[i]
+            mat.diffuse_color = (*rgb, 1.0)
+            emission = next(n for n in mat.node_tree.nodes if n.type == "EMISSION")
+            emission.inputs["Color"].default_value = (*rgb, 1.0)
+        for polygon, tri in zip(mesh.polygons, preview["triangles"]):
+            polygon.material_index = tri[3]
+        mesh.update()
+        _animation_cache["preview_key"] = cache_key
+    volume = scene.objects[scene["vp_volume"]]
+    center = volume.matrix_world @ (sum((Vector(p) for p in volume.bound_box), Vector()) / 8)
+    rotation = volume.matrix_world.to_quaternion()
+    offset = Vector(scene.get("vp_source_preview_offset", (-3.8, 0.0, 0.0)))
+    obj.matrix_world = (Matrix.Translation(center + rotation @ offset) @
+                        rotation.to_matrix().to_4x4() @ Matrix.Scale(min(volume.dimensions) / 2, 4))
+    obj["source_frame"] = source_frame.get("source_frame", index + 1)
+    set_visibility(obj, True)
 
 
 @persistent
@@ -1691,6 +1741,10 @@ def update_projection():
     body = projection_body()
     if body is None or "vp_lens_local" not in body:
         return
+    if scene.get("vp_content") != "ANIMATION":
+        preview = scene.objects.get(scene.get("vp_source_preview_object", ""))
+        if preview:
+            set_visibility(preview, False)
     bpy.context.view_layer.update()
     apply_model_parameters()
     world = body.matrix_world
@@ -1808,6 +1862,7 @@ def live_projection_tick():
                  parameters,
                  body.get("power", 1.0), scene.get("vp_content"),
                  scene.get("vp_animation_radius"), scene.get("vp_animation_loop"),
+                 scene.get("vp_show_source_preview"), tuple(scene.get("vp_source_preview_offset", ())),
                  tuple(scene.get(key) for key in OPTICAL_KEYS),
                  tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_image", "vp_show_layers",
                                                   "vp_hide_ray_geometry")),
@@ -1999,6 +2054,11 @@ class VP_PT_controls(bpy.types.Panel):
             layout.prop(scene, '["vp_animation_loop"]', text="动画循环")
             layout.label(text=f"动画帧 {scene.get('vp_animation_frame', 1)} / {scene.get('vp_animation_count', 0)}")
             layout.label(text=f"共像素气泡冲突: {scene.get('vp_animation_conflicts', 0)}")
+            if scene.get("vp_source_preview_available"):
+                layout.prop(scene, '["vp_show_source_preview"]', text="原始动画实体预览")
+                layout.prop(scene, '["vp_source_preview_offset"]', text="预览偏移")
+            else:
+                layout.label(text="无原始网格预览，请重新导出", icon="INFO")
             if scene.get("vp_animation_error"):
                 layout.label(text=scene["vp_animation_error"], icon="ERROR")
             row = layout.row(align=True)

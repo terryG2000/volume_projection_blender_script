@@ -41,9 +41,12 @@ def validate(data):
     if not isinstance(frames, list) or not 1 <= len(frames) <= 2000:
         raise ValueError("Expected 1..2000 frames")
     count = 0
+    preview_vertices = preview_triangles = 0
     for frame in frames:
         if not isinstance(frame, dict) or not isinstance(frame.get("points"), list):
             raise ValueError("Each frame needs a points array")
+        if "source_frame" in frame and (type(frame["source_frame"]) is not int or abs(frame["source_frame"]) > 1048574):
+            raise ValueError("Source frame must be a Blender frame integer")
         count += len(frame["points"])
         if count > MAX_POINTS:
             raise ValueError("Animation exceeds 500000 total points")
@@ -54,6 +57,26 @@ def validate(data):
                 raise ValueError("Point components must be finite numbers")
             if any(abs(v) > 1.000001 for v in point[:3]) or any(not 0 <= v <= 1 for v in point[3:]):
                 raise ValueError("Coordinates must be in [-1,1]; RGB in [0,1]")
+        preview = frame.get("preview")
+        if preview is not None:
+            if not isinstance(preview, dict) or any(not isinstance(preview.get(k), list) for k in ("vertices", "triangles", "colors")):
+                raise ValueError("Invalid source mesh preview")
+            vertices, triangles, colors = (preview[k] for k in ("vertices", "triangles", "colors"))
+            preview_vertices += len(vertices)
+            preview_triangles += len(triangles)
+            if preview_vertices > 500000 or preview_triangles > 1000000 or len(colors) > 256:
+                raise ValueError("Source preview exceeds mesh/color budget")
+            for values, low, high in ((vertices, -1.000001, 1.000001), (colors, 0, 1)):
+                for row in values:
+                    if (not isinstance(row, list) or len(row) != 3 or
+                            any(isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v)
+                                or not low <= v <= high for v in row)):
+                        raise ValueError("Invalid preview coordinate/color")
+            for tri in triangles:
+                if (not isinstance(tri, list) or len(tri) != 4 or
+                        any(type(v) is not int for v in tri) or
+                        any(not 0 <= v < len(vertices) for v in tri[:3]) or not 0 <= tri[3] < len(colors)):
+                    raise ValueError("Invalid preview triangle/material index")
     return data
 
 
@@ -64,28 +87,40 @@ def read(filepath):
     return validate(json.loads(path.read_text(encoding="utf-8")))
 
 
-def sample_surface(objects, depsgraph, count, seed=2006):
+def sample_surface(objects, depsgraph, count, seed=2006, include_preview=False):
     triangles, cumulative = [], []
+    preview = {"vertices": [], "triangles": [], "colors": []}
+    color_indices = {}
     total = 0.0
     for obj in objects:
         evaluated = obj.evaluated_get(depsgraph)
         mesh = evaluated.to_mesh()
         try:
             mesh.calc_loop_triangles()
+            world_vertices = [evaluated.matrix_world @ v.co for v in mesh.vertices]
+            offset = len(preview["vertices"])
+            if include_preview:
+                preview["vertices"].extend([list(v) for v in world_vertices])
             for tri in mesh.loop_triangles:
-                vertices = [evaluated.matrix_world @ mesh.vertices[i].co for i in tri.vertices]
+                vertices = [world_vertices[i] for i in tri.vertices]
                 area = (vertices[1] - vertices[0]).cross(vertices[2] - vertices[0]).length / 2
                 if area <= 1e-12:
                     continue
                 material = mesh.materials[tri.material_index] if tri.material_index < len(mesh.materials) else None
                 color = tuple(material.diffuse_color[:3]) if material else tuple(obj.color[:3])
+                color = tuple(max(0.0, min(1.0, c)) for c in color)
+                if include_preview:
+                    if color not in color_indices:
+                        color_indices[color] = len(preview["colors"])
+                        preview["colors"].append(list(color))
+                    preview["triangles"].append([*(offset + i for i in tri.vertices), color_indices[color]])
                 triangles.append((vertices, color))
                 total += area
                 cumulative.append(total)
         finally:
             evaluated.to_mesh_clear()
     if not triangles:
-        return []
+        return ([], preview) if include_preview else []
     rng = random.Random(seed)
     points = []
     for _ in range(count):
@@ -93,7 +128,7 @@ def sample_surface(objects, depsgraph, count, seed=2006):
         u, v = math.sqrt(rng.random()), rng.random()
         position = (1 - u) * vertices[0] + u * (1 - v) * vertices[1] + u * v * vertices[2]
         points.append([*position, *(max(0.0, min(1.0, c)) for c in color)])
-    return points
+    return (points, preview) if include_preview else points
 
 
 def export_animation(filepath, scene, objects, samples=2048):
@@ -112,15 +147,17 @@ def export_animation(filepath, scene, objects, samples=2048):
             for number in range(scene.frame_start, scene.frame_end + 1):
                 scene.frame_set(number)
                 depsgraph = bpy.context.evaluated_depsgraph_get()
-                points = sample_surface(objects, depsgraph, samples)
-                for point in points:
+                points, preview = sample_surface(objects, depsgraph, samples, include_preview=True)
+                for point in preview["vertices"]:
                     for axis in range(3):
                         low[axis] = min(low[axis], point[axis])
                         high[axis] = max(high[axis], point[axis])
-                frames.append({"source_frame": number, "points": points})
+                frames.append({"source_frame": number, "points": points, "preview": preview})
+                if sum(len(f["preview"]["vertices"]) for f in frames) > 500000 or sum(len(f["preview"]["triangles"]) for f in frames) > 1000000:
+                    raise ValueError("Source preview exceeds mesh budget; reduce source mesh or frame range")
     finally:
         scene.frame_set(old_frame, subframe=subframe)
-    if not math.isfinite(low.x):
+    if not math.isfinite(low.x) or not any(f["points"] for f in frames):
         raise ValueError("No non-degenerate mesh surfaces in the animation")
     center = (low + high) / 2
     extent = max(high - low)
@@ -130,6 +167,8 @@ def export_animation(filepath, scene, objects, samples=2048):
         for point in frame["points"]:
             point[:3] = [round((point[i] - center[i]) * scale, 6) for i in range(3)]
             point[3:] = [round(v, 6) for v in point[3:]]
+        for vertex in frame["preview"]["vertices"]:
+            vertex[:] = [round((vertex[i] - center[i]) * scale, 6) for i in range(3)]
     data = {"format": FORMAT, "version": VERSION, "coordinates": "normalized_isotropic",
             "color_space": "linear_rgb", "fps": scene.render.fps / scene.render.fps_base,
             "frames": frames, "source": {"blend": bpy.data.filepath, "scene": scene.name,
@@ -141,7 +180,10 @@ def export_animation(filepath, scene, objects, samples=2048):
     validate(data)
     path = Path(filepath)
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(json.dumps(data, separators=(",", ":"), allow_nan=False), encoding="utf-8")
+    serialized = json.dumps(data, separators=(",", ":"), allow_nan=False)
+    if len(serialized.encode("utf-8")) > MAX_BYTES:
+        raise ValueError("Animation with source preview exceeds 64 MiB")
+    path.write_text(serialized, encoding="utf-8")
     return data
 
 
