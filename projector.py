@@ -1669,9 +1669,12 @@ def update_optical_projection(frame):
     flux = max(0.0, float(scene["vp_flux_w"])) * power if enabled else 0.0
     lens = body.matrix_world @ Vector(body["vp_lens_local"])
     rotation = body.matrix_world.to_quaternion()
-    spot.location = lens
+    if spot.location != lens:
+        spot.location = lens
     # Preserve projector roll as well as its optical axis.
-    spot.rotation_quaternion = rotation @ Vector((0, -1, 0)).to_track_quat("-Z", "Y")
+    spot_rotation = rotation @ Vector((0, -1, 0)).to_track_quat("-Z", "Y")
+    if spot.rotation_quaternion != spot_rotation:
+        spot.rotation_quaternion = spot_rotation
     tan_x = math.tan(math.radians(scene["vp_fov_x"]) / 2)
     tan_z = math.tan(math.radians(scene["vp_fov_z"]) / 2)
     spot.data.spot_size = min(math.pi, 2 * math.atan(math.hypot(tan_x, tan_z)) + 0.01)
@@ -1696,27 +1699,32 @@ def update_optical_projection(frame):
         set_visibility(receiver, scene["vp_show_receiver"])
     # Glass is a visual envelope only in this straight-ray approximation.
     volume = scene.objects[scene["vp_volume"]]
-    volume.visible_shadow = False
+    if volume.visible_shadow:
+        volume.visible_shadow = False
     remove_volume_reflections(volume)
     for obj in scene.objects:
-        if obj.get("vp_generated") and obj.name.startswith("Projector_Lens"):
+        if obj.get("vp_generated") and obj.name.startswith("Projector_Lens") and obj.visible_shadow:
             obj.visible_shadow = False
     remove_legacy_scattering(scene)
     material = bpy.data.materials[scene["vp_optical_marker_material"]]
     for node in material.node_tree.nodes:
         if node.type == "EMISSION":
-            node.inputs["Strength"].default_value = 1.0
+            if node.inputs["Strength"].default_value != 1.0:
+                node.inputs["Strength"].default_value = 1.0
     for bubble in (o for o in scene.objects if o.get("vp_role") == "bubble"):
-        bubble["vp_scattered_w"] = 0.0
+        if bubble.get("vp_scattered_w") != 0.0:
+            bubble["vp_scattered_w"] = 0.0
         if bubble.data.materials[0] != material:
             bubble.data.materials[0] = material
-        bubble.visible_shadow = False
+        if bubble.visible_shadow:
+            bubble.visible_shadow = False
     ray_material = bpy.data.materials[scene["vp_optical_ray_material"]]
     for obj in scene.objects:
         if obj.get("vp_role") in {"beam", "image"}:
             if obj.data.materials[0] != ray_material:
                 obj.data.materials[0] = ray_material
-            obj.visible_shadow = False
+            if obj.visible_shadow:
+                obj.visible_shadow = False
     scene["vp_scattered_total_w"] = 0.0
     bpy.context.view_layer.update()
 
@@ -1816,8 +1824,12 @@ def projection_frame(scene, body, image_data=None):
 
 
 def set_visibility(obj, visible):
-    obj.hide_render = not visible
-    obj.hide_set(not visible)
+    hidden = not visible
+    if obj.hide_render != hidden:
+        obj.hide_render = hidden
+    # hide_set invalidates the view layer even if the flag has not changed.
+    if obj.hide_get() != hidden:
+        obj.hide_set(hidden)
 
 
 def update_projection():
@@ -1846,26 +1858,38 @@ def update_projection():
         if role == "bubble":
             sample = project_to_pixel(body, obj.matrix_world.translation)
             color = sample_projection_color(body, sample, frame, bubble_image_data)
-            obj["vp_incident_color"] = color
-            obj.color = tuple(channel * power for channel in color[:3]) + (1.0,)
-            obj["vp_lit"] = power > 0 and max(color[:3]) > 0.001
-            lit_count += int(obj["vp_lit"])
+            if tuple(obj.get("vp_incident_color", ())) != color:
+                obj["vp_incident_color"] = color
+            display_color = Vector(tuple(channel * power for channel in color[:3]) + (1.0,))
+            if Vector(obj.color) != display_color:
+                obj.color = display_color
+            lit = power > 0 and max(color[:3]) > 0.001
+            if obj.get("vp_lit") != lit:
+                obj["vp_lit"] = lit
+            lit_count += int(lit)
         elif role in {"beam", "image"}:
             target = world @ Vector(obj["vp_target_local"])
             if role == "beam":
                 points = obj.data.splines[0].points
-                points[0].co = (*lens, 1.0)
-                points[-1].co = (*target, 1.0)
+                start, end = Vector((*lens, 1.0)), Vector((*target, 1.0))
+                if points[0].co != start:
+                    points[0].co = start
+                if points[-1].co != end:
+                    points[-1].co = end
                 signal = frame.get((obj.get("pixel_x", -1), obj.get("pixel_z", -1)), (1, 1, 1, 1))
                 obj.color = tuple(c * power for c in signal[:3]) + (1.0,)
                 visible = (scene.get("vp_show_rays", True) and not obj.get("vp_coarse", False)
                            and not scene.get("vp_hide_ray_geometry", False))
                 set_visibility(obj, visible and power > 0 and max(signal[:3]) > 0.001)
             else:
-                obj.location = target
-                obj.rotation_euler = body.rotation_euler
+                if obj.location != target:
+                    obj.location = target
+                if obj.rotation_euler != body.rotation_euler:
+                    obj.rotation_euler = body.rotation_euler
                 color = frame[obj["pixel_x"], obj["pixel_z"]]
-                obj.color = tuple(channel * power for channel in color[:3]) + (1.0,)
+                display_color = Vector(tuple(channel * power for channel in color[:3]) + (1.0,))
+                if Vector(obj.color) != display_color:
+                    obj.color = display_color
                 set_visibility(obj, scene.get("vp_show_image", False))
         elif role == "frustum":
             coordinates = obj["vp_vertices_local"]

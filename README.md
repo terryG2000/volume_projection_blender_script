@@ -2,6 +2,8 @@
 
 测试进程管理：每次测试结束（包括失败、超时和取消）后，确认本次启动的测试进程及其子进程退出，按记录的 PID/会话清理残留；不得按进程名称批量结束 Blender。用户编辑窗口及明确要求保留的演示窗口不属于清理对象。维护规则见 `AGENTS.md`。
 
+开发过程记录：所有开发与优化都必须在 `docs/development/` 下维护 Markdown 开发日志，记录需求、调查、决策、实现、验证、限制、进程清理和代码来源，不以最终变更摘要代替过程记录。本次性能调查见 [动画性能开发记录](docs/development/2026-10-20-animation-performance.md)。
+
 普通透视投影仪向玻璃投射图像，玻璃内的球体直接显示当前光路采样颜色，不再产生散射照明。默认按当前投影仪姿态动态设计点云。当前版本在 Blender 5.2.1 LTS 验证。
 默认建立独立的 `VolumeProjection` 场景，保留原场景；重复运行会重新连接控制并保留手动修改。
 当前开发分支：`codex/projected-image-scattering`，保留 Cycles 图像投影，点云改为纯颜色显示。
@@ -15,6 +17,9 @@
 - `tests/test_projection_blender.py`：Blender 回归测试。
 - `tests/test_optical_render_blender.py`：实际渲染验证，检查 RGB 方向、关灯响应、球体不照亮其他物体和玻璃透射。
 - `tests/test_denoise_render_blender.py`：OptiX 下 12 采样的降噪前后对照，检查地面颗粒与高饱和像素保留。
+- `tests/test_update_performance_blender.py`：条件写入、重复更新及手动修改恢复回归。
+- `tests/benchmark_animation_blender.py`：保存场景的帧更新剖析，可比较 Git 旧版代码和固定种子的静帧渲染，不覆盖输入场景。
+- `docs/development/`：开发与优化的 Markdown 过程记录。
 - `README.md`、`CHANGELOG.md`、`AGENTS.md`：使用说明、变更历史和维护约定。
 - `Nayar_TR06.pdf`：参考论文，保留原文件。
 - `outputs/`：可编辑场景、预览及导出数据，保留已有结果。
@@ -80,7 +85,7 @@
 
 2026-10-20 验证：Blender 5.2.1 LTS 上 17 项动画、39 项静态回归和原有光学渲染检查通过；已检查清晰版第 1、13 帧预览。透明点云仍会叠加前后表面，不能获得不透明实体的遮挡效果；本次没有测量实时 FPS 或重跑降噪专项。
 
-本机此次 GUI 演示自动播放后进程退出，静帧重开也未保持进程，日志未提供明确原因，本次未能保留 GUI 窗口。场景已成功保存，可在本地终端尝试下面的重开命令；离线渲染和功能回归不等于 GUI 连续播放验证。
+GUI 状态更正：之前根据非提升权限进程查询推断“窗口已退出”的证据不足，后续界面检查确认演示窗口仍在。不能据此认定崩溃，也不将单次界面观察视为连续播放稳定性验证。下面命令可重开已保存场景；已有未保存编辑时应在原窗口重新运行脚本，不从磁盘覆盖当前场景。
 加 `--background --python-exit-code 1` 并在脚本后传入 `-- --render-preview`，可后台生成第 1、13 帧的 PNG 对照；后台模式不会保留窗口。
 传入 `-- --paused` 可在 GUI 中生成后停在静帧，不自动播放。
 
@@ -161,6 +166,26 @@
 验证记录见 `outputs/gpu_render_verification.json`（含脚本 SHA-256）。同一演示、1280 x 820、32 采样并开启最终降噪，连续两次静帧实测 CPU 为 17.55 / 17.22 秒，GPU 为 5.92 / 6.38 秒，包含 PNG 输出。
 这是该次运行的静帧对照，不是视口旋转 FPS 或稳定性能保证。显存占用、驱动、初次缓存和其他程序负载都会影响结果；GPU 渲染失败或显存不足不会被静默重试成 CPU。
 受限测试环境无法写入默认 OptiX 缓存目录时，驱动会回退到项目内的 `optix7cache.db`，该缓存已忽略，不进入 Git。
+
+### 动画更新性能
+
+2026-10-20 至 21 日定位到的主要瓶颈在 CPU 场景更新：每帧对数千个已隐藏参考像素再次调用 `hide_set`，约占基线剖析帧的 76%。GPU 并不能消除这部分开销。现在仅在实际状态改变时写入可见性、颜色、变换和部分光学属性，仍保留最终依赖图求值，不使用可能漏掉手动编辑的跨帧状态缓存。
+
+同一个 3072 点场景、6337 个对象、Cycles/OptiX、12 采样的后台测量：
+
+| 指标 | 基线 `6f4829d` | 优化后 |
+| --- | ---: | ---: |
+| 6 次切帧中位数 | 3.425 秒 | 0.539 秒 |
+| 640×440 第一次静帧渲染总耗时 | 17.407 秒 | 5.979 秒 |
+| 同一进程第二次静帧渲染总耗时 | 13.034 秒 | 5.537 秒 |
+
+切帧耗时约为原来的 16%，第二次渲染约为原来的 42%。没有减少气泡、改变取色规则或降低采样/降噪；固定种子输出的 281600 个像素中仅 5 个像素相差 1 个 8-bit RGB 灰度级，目视无明显变化。渲染计时包含回调、同步、着色器、采样、降噪和 PNG 保存，不是纯 GPU 速度；本轮桌面锁定、已有 GUI 负载未隔离，不能换算为实际视口 FPS，也不保证实时 24 FPS。剩余开销主要仍在依赖图求值。
+
+已有窗口需暂停播放后，在原窗口重新运行磁盘上的 `projector.py` 才会使用新逻辑；不需要 `--rebuild`，原有手动编辑和参数继续保留。重新打开已保存的实验可用上文 `--keep-open` 命令。本轮没有操作锁定的 GUI，也没有覆盖演示 `.blend`。
+
+完整调查、分步对照、复现命令及验证结果见 [开发记录](docs/development/2026-10-20-animation-performance.md)。
+
+验证：66 项功能回归（3 项更新性能、20 项动画、43 项投影）及光学、12 采样降噪渲染检查通过。后台测试进程正常退出，并按 PID 确认无直接子进程残留；没有关闭用户演示窗口。
 
 ### 视口降噪
 
@@ -285,6 +310,7 @@ CSV 的 `pixel_*_calibrated` 是最近一次点云生成时的索引，`pixel_*_
 & 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_optical_render_blender.py
 & 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_denoise_render_blender.py
 & 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_animation_blender.py
+& 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --background --factory-startup --python-exit-code 1 --python tests/test_update_performance_blender.py
 ```
 
 测试覆盖初始像素映射、有限气泡与其他中心射线的分离、玻璃内部边界、投影仪变换、
