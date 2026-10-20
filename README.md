@@ -77,6 +77,8 @@
 生成文件为 `outputs/rotating_cube.pointcloud.json` 和 `outputs/rotating_cube_clear.blend`。实体原动画与点云同屏展示，原 `rotating_cube_projection.blend`、`rotating_cube_comparison.blend` 保留不覆盖。它们是可重新生成的实验产物，不纳入 Git；JSON 的 `source` 记录源提交、工作树是否修改及导出器 SHA256。
 
 2026-10-20 验证：Blender 5.2.1 LTS 上 17 项动画、39 项静态回归和原有光学渲染检查通过；已检查清晰版第 1、13 帧预览。透明点云仍会叠加前后表面，不能获得不透明实体的遮挡效果；本次没有测量实时 FPS 或重跑降噪专项。
+
+本机此次 GUI 演示自动播放后进程退出，静帧重开也未保持进程，日志未提供明确原因，本次未能保留 GUI 窗口。场景已成功保存，可在本地终端尝试下面的重开命令；离线渲染和功能回归不等于 GUI 连续播放验证。
 加 `--background --python-exit-code 1` 并在脚本后传入 `-- --render-preview`，可后台生成第 1、13 帧的 PNG 对照；后台模式不会保留窗口。
 
 打开保存的测试场景并重新连接播放控制：
