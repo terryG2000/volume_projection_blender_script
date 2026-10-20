@@ -595,10 +595,112 @@ class OpticalTests(unittest.TestCase):
         self.assertTrue(all(o.hide_render for o in self.scene.objects if o.get("vp_role") in {"beam", "scatter"}))
 
 
+class MetricProjectionTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        projection.build_scene()
+        cls.scene = bpy.context.scene
+        cls.body = projection.projection_body()
+
+    def setUp(self):
+        self.scene["vp_content"] = "COLOR_BARS"
+        self.scene["vp_depth_compensation"] = True
+        self.scene["vp_image_width_m"], self.scene["vp_image_height_m"] = 1.6, 1.2
+        self.scene["vp_freeze_points"] = True
+        self.scene.unit_settings.scale_length = 1.0
+        projection.update_projection()
+
+    def test_equal_world_width_at_different_depths_has_equal_target_coordinates(self):
+        volume = self.scene.objects[self.scene["vp_volume"]]
+        center = volume.matrix_world.translation
+        near, far = center + Vector((0.3, 0.7, 0.2)), center + Vector((0.3, -0.7, 0.2))
+        self.assertEqual(projection.metric_image_sample(self.scene, self.body, near),
+                         projection.metric_image_sample(self.scene, self.body, far))
+        self.assertNotEqual(projection.project_to_pixel(self.body, near),
+                            projection.project_to_pixel(self.body, far))
+        nx, nz = self.body["vp_grid"]
+        sample = projection.metric_image_sample(self.scene, self.body, near)
+        self.assertAlmostEqual(sample[0], (0.3 / 1.6 + 0.5) * nx - 0.5, places=5)
+        self.assertAlmostEqual(sample[1], (0.2 / 1.2 + 0.5) * nz - 0.5, places=5)
+
+    def test_compensated_image_texture_and_points_use_same_warp(self):
+        image = bpy.data.images.new("MetricTestImage", width=8, height=8, alpha=True)
+        image.pixels = [v for y in range(8) for x in range(8) for v in (x / 7, y / 7, 0.25, 1)]
+        self.scene["vp_source_image"], self.scene["vp_content"] = image.name, "IMAGE"
+        try:
+            positions = {o.name: tuple(o.matrix_world.translation) for o in self.scene.objects
+                         if o.get("vp_role") == "bubble"}
+            projection.update_projection()
+            frame = projection.projection_frame(self.scene, self.body)
+            nx, nz = self.body["vp_grid"]
+            texture = bpy.data.images[self.scene["vp_frame_image"]]
+            pixels = list(texture.pixels)
+            spot = self.scene.objects[self.scene["vp_spot"]]
+            self.assertEqual(spot.data.node_tree.nodes["ProjectionImage"].image, texture)
+            for bubble in (o for o in self.scene.objects if o.get("vp_role") == "bubble"):
+                self.assertEqual(positions[bubble.name], tuple(bubble.matrix_world.translation))
+                sample = projection.project_to_pixel(self.body, bubble.matrix_world.translation)
+                if sample is not None:
+                    ix, iz = (math.floor(v + 0.5) for v in sample)
+                    for actual, expected in zip(bubble.color, frame[ix, iz]):
+                        self.assertAlmostEqual(actual, expected, places=5)
+                    for actual, expected in zip(pixels[(iz * nx + ix) * 4:(iz * nx + ix) * 4 + 4], frame[ix, iz]):
+                        self.assertAlmostEqual(actual, expected, places=5)
+            self.scene["vp_depth_compensation"] = False
+            projection.update_projection()
+            self.assertEqual(spot.data.node_tree.nodes["ProjectionImage"].image, image)
+        finally:
+            self.scene["vp_content"] = "COLOR_BARS"
+            bpy.data.images.remove(image)
+
+    def test_metric_image_boundaries_units_and_pixel_conflicts(self):
+        volume = self.scene.objects[self.scene["vp_volume"]]
+        center = volume.matrix_world.translation
+        self.assertIsNone(projection.metric_image_sample(self.scene, self.body, center + Vector((1, 0, 0))))
+        old_unit = self.scene.unit_settings.scale_length
+        try:
+            self.scene.unit_settings.scale_length = 0.5
+            half = projection.metric_image_sample(self.scene, self.body, center + Vector((0.6, 0, 0)))
+            self.scene.unit_settings.scale_length = 1.0
+            full = projection.metric_image_sample(self.scene, self.body, center + Vector((0.3, 0, 0)))
+            for a, b in zip(half, full):
+                self.assertAlmostEqual(a, b, places=5)
+        finally:
+            self.scene.unit_settings.scale_length = old_unit
+        bubbles = [o for o in self.scene.objects if o.get("vp_role") == "bubble"]
+        old = bubbles[1].location.copy()
+        try:
+            bubbles[1].location = bubbles[0].location
+            projection.update_projection()
+            self.assertGreater(self.scene["vp_compensation_conflicts"], 0)
+            self.assertEqual(tuple(bubbles[0].color), tuple(bubbles[1].color))
+        finally:
+            bubbles[1].location = old
+            projection.update_projection()
+
+    def test_export_records_metric_coordinates_and_compensation_settings(self):
+        old_unit = self.scene.unit_settings.scale_length
+        try:
+            self.scene.unit_settings.scale_length = 0.5
+            folder = ROOT / "tmp" / "metric_export"
+            projection.export_projection(folder)
+            metadata = json.loads((folder / "projection_settings.json").read_text(encoding="utf-8"))
+            self.assertEqual(metadata["scene_meters_per_blender_unit"], 0.5)
+            self.assertTrue(metadata["parameters"]["vp_depth_compensation"])
+            with (folder / "bubble_coordinates.csv").open(encoding="utf-8-sig", newline="") as stream:
+                row = next(csv.DictReader(stream))
+            bubble = self.scene.objects[row["name"]]
+            for axis, key in enumerate(("x_m", "y_m", "z_m")):
+                self.assertAlmostEqual(float(row[key]), bubble.matrix_world.translation[axis] * 0.5)
+        finally:
+            self.scene.unit_settings.scale_length = old_unit
+
+
 if __name__ == "__main__":
     suite = unittest.TestSuite([unittest.defaultTestLoader.loadTestsFromTestCase(ProjectionTests),
                                 unittest.defaultTestLoader.loadTestsFromTestCase(ParametricTests),
-                                unittest.defaultTestLoader.loadTestsFromTestCase(OpticalTests)])
+                                unittest.defaultTestLoader.loadTestsFromTestCase(OpticalTests),
+                                unittest.defaultTestLoader.loadTestsFromTestCase(MetricProjectionTests)])
     result = unittest.TextTestRunner(verbosity=2).run(suite)
     if not result.wasSuccessful():
         raise RuntimeError("Projection regression tests failed")

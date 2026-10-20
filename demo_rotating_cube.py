@@ -17,6 +17,7 @@ spec.loader.exec_module(projection)
 animation = projection.animation_module()
 
 source, cube = animation.create_rotating_cube()
+cube.scale = (0.5, 0.5, 0.5)  # One-metre cube; the complete rotation fits the glass.
 animation.export_animation(ROOT / "outputs" / "rotating_cube.pointcloud.json", source, [cube], 1200)
 data = projection.build_scene()
 scene = bpy.context.scene
@@ -35,11 +36,11 @@ scene.camera.data.lens = 40
 scene.render.use_lock_interface = True
 if not bpy.app.background:
     projection.select_projector_for_manual_adjustment(data)
-projection.save_blend_file(ROOT / "outputs" / "rotating_cube_clear.blend")
+projection.save_blend_file(ROOT / "outputs" / "rotating_cube_metric.blend")
 if "--render-preview" in sys.argv:
     for frame in (1, 13):
         scene.frame_set(frame)
-        projection.render_preview(ROOT / "outputs" / f"rotating_cube_clear_frame_{frame:02}.png")
+        projection.render_preview(ROOT / "outputs" / f"rotating_cube_metric_frame_{frame:02}.png")
     scene.frame_set(1)
-if not bpy.app.background:
+if not bpy.app.background and "--paused" not in sys.argv:
     bpy.ops.screen.animation_play()

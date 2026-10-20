@@ -55,6 +55,8 @@ SCENE_VERSION = 2
 DEPTH_SEED = 2006
 MODEL_KEYS = ("vp_fov_x", "vp_fov_z", "vp_samples_x", "vp_samples_z", "vp_layers", "vp_radius", "vp_freeze_points")
 OPTICAL_KEYS = ("vp_optics", "vp_flux_w", "vp_show_receiver", "vp_source_image")
+SIZE_KEYS = ("vp_depth_compensation", "vp_image_width_m", "vp_image_height_m",
+             "vp_animation_actual_size", "vp_animation_size_m")
 
 RAY_GRID_X = 6 if FAST_PREVIEW else 13
 RAY_GRID_Z = 4 if FAST_PREVIEW else 9
@@ -95,6 +97,11 @@ def load_point_animation(filepath):
     scene["vp_animation_path"] = str(filepath)
     scene["vp_animation_radius"] = 0.14
     scene["vp_animation_surface"] = scene.get("vp_animation_surface", False)
+    volume = scene.objects[scene["vp_volume"]]
+    scene["vp_animation_actual_size"] = "meters_per_normalized_unit" in data
+    scene["vp_animation_size_m"] = 1.6 * data.get(
+        "meters_per_normalized_unit", min(volume.dimensions) / 2 * scene.unit_settings.scale_length)
+    scene.id_properties_ui("vp_animation_size_m").update(min=0.000001, soft_max=10.0)
     scene.id_properties_ui("vp_animation_radius").update(min=0.005, max=0.5)
     scene["vp_animation_loop"] = True
     scene["vp_show_source_preview"] = scene.get("vp_show_source_preview", True)
@@ -110,6 +117,20 @@ def load_point_animation(filepath):
     _animation_cache.update(key=(text.name, text.as_pointer()), data=data)
     scene.frame_set(1)
     update_projection()
+
+
+def animation_spatial_transform(scene):
+    volume = scene.objects[scene["vp_volume"]]
+    center = volume.matrix_world @ (sum((Vector(p) for p in volume.bound_box), Vector()) / 8)
+    scale = min(volume.dimensions) / 2
+    if scene.get("vp_animation_actual_size", False):
+        size = float(scene["vp_animation_size_m"])
+        if not math.isfinite(size) or size <= 0:
+            raise ValueError("动画实际尺寸必须为正数")
+        scale = size / 1.6 / scene.unit_settings.scale_length
+    if scale <= 1e-8:
+        raise ValueError("玻璃或目标尺寸必须非零")
+    return center, volume.matrix_world.to_quaternion(), scale
 
 
 def point_animation_frame(scene, body):
@@ -146,10 +167,13 @@ def point_animation_frame(scene, body):
     half_extent = min(volume.dimensions) / 2
     if half_extent <= 1e-8:
         raise ValueError("玻璃尺寸必须非零")
-    local_center = sum((Vector(p) for p in volume.bound_box), Vector()) / 8
-    center = volume.matrix_world @ local_center
-    rotation = volume.matrix_world.to_quaternion().inverted()
-    radius = max(0.005, min(0.5, float(scene.get("vp_animation_radius", 0.14))))
+    center, orientation, target_scale = animation_spatial_transform(scene)
+    rotation = orientation.inverted()
+    radius = max(0.005, min(0.5, float(scene.get("vp_animation_radius", 0.14)))) * half_extent / target_scale
+    bounds = (data["frames"][index].get("preview") or {}).get("vertices", points)
+    scene["vp_animation_outside_volume"] = any(
+        abs(p[axis]) * target_scale > volume.dimensions[axis] / 2 + 1e-6
+        for p in bounds for axis in range(3))
     contributors = {}
     for bubble in (o for o in scene.objects if o.get("vp_role") == "bubble"):
         pixel = project_to_pixel(body, bubble.matrix_world.translation)
@@ -159,7 +183,7 @@ def point_animation_frame(scene, body):
         contributors[pixel] = contributors.get(pixel, 0) + 1
         if not points:
             continue
-        position = rotation @ (bubble.matrix_world.translation - center) / half_extent
+        position = rotation @ (bubble.matrix_world.translation - center) / target_scale
         surface = _animation_cache.get("surface") if scene.get("vp_animation_surface", False) else None
         if surface is not None:
             _, _, nearest, distance = surface.find_nearest(position)
@@ -213,11 +237,10 @@ def update_source_preview(scene, source_frame, index):
         mesh.update()
         _animation_cache["preview_key"] = cache_key
     volume = scene.objects[scene["vp_volume"]]
-    center = volume.matrix_world @ (sum((Vector(p) for p in volume.bound_box), Vector()) / 8)
-    rotation = volume.matrix_world.to_quaternion()
+    center, rotation, target_scale = animation_spatial_transform(scene)
     offset = Vector(scene.get("vp_source_preview_offset", (-3.8, 0.0, 0.0)))
     obj.matrix_world = (Matrix.Translation(center + rotation @ offset) @
-                        rotation.to_matrix().to_4x4() @ Matrix.Scale(min(volume.dimensions) / 2, 4))
+                        rotation.to_matrix().to_4x4() @ Matrix.Scale(target_scale, 4))
     obj["source_frame"] = source_frame.get("source_frame", index + 1)
     set_visibility(obj, True)
 
@@ -1486,12 +1509,16 @@ def ensure_optical_settings(reset=False):
     scene = bpy.context.scene
     defaults = {"vp_optics": True, "vp_flux_w": 180.0,
                 "vp_show_receiver": True, "vp_source_image": "", "vp_hide_ray_geometry": False,
-                "vp_animation_surface": False}
+                "vp_animation_surface": False, "vp_depth_compensation": False,
+                "vp_image_width_m": 1.6, "vp_image_height_m": 1.6,
+                "vp_animation_actual_size": False, "vp_animation_size_m": 1.6}
     for key, value in defaults.items():
         if reset or key not in scene:
             scene[key] = value
     scene["vp_flux_w"] = max(0.0, float(scene["vp_flux_w"]))
     scene.id_properties_ui("vp_flux_w").update(min=0.0, max=5000.0)
+    for key in ("vp_image_width_m", "vp_image_height_m", "vp_animation_size_m"):
+        scene.id_properties_ui(key).update(min=0.000001, soft_max=10.0)
 
 
 def load_projection_image(filepath):
@@ -1653,7 +1680,8 @@ def update_optical_projection(frame):
     nodes["FOV_X"].inputs[1].default_value = 1 / (2 * tan_x)
     nodes["FOV_Y"].inputs[1].default_value = 1 / (2 * tan_z)
     nx, nz = body["vp_grid"]
-    source = bpy.data.images.get(scene.get("vp_source_image", "")) if scene.get("vp_content") == "IMAGE" else None
+    source = (bpy.data.images.get(scene.get("vp_source_image", ""))
+              if scene.get("vp_content") == "IMAGE" and not depth_compensation_enabled(scene) else None)
     if source is None:
         source = bpy.data.images.get(scene.get("vp_frame_image", ""))
         if source is None:
@@ -1716,6 +1744,47 @@ def sample_projection_color(body, sample, frame, image_data):
     return frame.get(tuple(math.floor(v + 0.5) for v in sample), (0.0, 0.0, 0.0, 1.0))
 
 
+def depth_compensation_enabled(scene):
+    return bool(scene.get("vp_depth_compensation", False)) and scene.get("vp_content") in {
+        "IMAGE", "TEST", "COLOR_BARS", "WHITE"}
+
+
+def metric_image_sample(scene, body, world_position):
+    """Parallel target coordinates; only the input image is warped, never the rays."""
+    volume = scene.objects[scene["vp_volume"]]
+    center = volume.matrix_world @ (sum((Vector(p) for p in volume.bound_box), Vector()) / 8)
+    local = volume.matrix_world.to_quaternion().inverted() @ (Vector(world_position) - center)
+    local *= scene.unit_settings.scale_length
+    width, height = float(scene["vp_image_width_m"]), float(scene["vp_image_height_m"])
+    if not all(math.isfinite(v) and v > 0 for v in (width, height)):
+        raise ValueError("投影实际宽高必须为正数")
+    u, v = local.x / width + 0.5, local.z / height + 0.5
+    if not (0 <= u < 1 and 0 <= v < 1):
+        return None
+    nx, nz = body["vp_grid"]
+    return u * nx - 0.5, v * nz - 0.5
+
+
+def compensate_projection_frame(scene, body, source_frame, image_data):
+    frame = {pixel: (0.0, 0.0, 0.0, 1.0) for pixel in source_frame}
+    contributors = {}
+    unaddressed = 0
+    for bubble in (o for o in scene.objects if o.get("vp_role") == "bubble"):
+        position = bubble.matrix_world.translation
+        ray_sample = project_to_pixel(body, position)
+        if ray_sample is None:
+            unaddressed += 1
+            continue
+        pixel = tuple(math.floor(v + 0.5) for v in ray_sample)
+        contributors[pixel] = contributors.get(pixel, 0) + 1
+        color = sample_projection_color(body, metric_image_sample(scene, body, position),
+                                        source_frame, image_data)
+        frame[pixel] = tuple(max(a, b) for a, b in zip(frame[pixel][:3], color[:3])) + (1.0,)
+    scene["vp_compensation_conflicts"] = sum(n - 1 for n in contributors.values())
+    scene["vp_compensation_unaddressed"] = unaddressed
+    return frame
+
+
 def projection_frame(scene, body, image_data=None):
     nx, nz = body["vp_grid"]
     mode = scene.get("vp_content", "TEST")
@@ -1741,6 +1810,8 @@ def projection_frame(scene, body, image_data=None):
                 active, rgb, brightness = pattern_pixel(ix, iz, nx, nz)
                 color = tuple(channel * brightness if active else 0.0 for channel in rgb[:3]) + (1.0,)
             frame[ix, iz] = color
+    if depth_compensation_enabled(scene):
+        return compensate_projection_frame(scene, body, frame, image_data)
     return frame
 
 
@@ -1764,6 +1835,8 @@ def update_projection():
     lens = world @ Vector(body["vp_lens_local"])
     image_data = projection_image_data(scene)
     frame = projection_frame(scene, body, image_data)
+    # Compensated pixels are already sampled from the source image at each depth.
+    bubble_image_data = None if depth_compensation_enabled(scene) else image_data
     lit_count = 0
     power = max(0.0, float(body.get("power", 1.0)))
     if scene.get("vp_optics", True) and float(scene.get("vp_flux_w", 180.0)) <= 0:
@@ -1772,7 +1845,7 @@ def update_projection():
         role = obj.get("vp_role")
         if role == "bubble":
             sample = project_to_pixel(body, obj.matrix_world.translation)
-            color = sample_projection_color(body, sample, frame, image_data)
+            color = sample_projection_color(body, sample, frame, bubble_image_data)
             obj["vp_incident_color"] = color
             obj.color = tuple(channel * power for channel in color[:3]) + (1.0,)
             obj["vp_lit"] = power > 0 and max(color[:3]) > 0.001
@@ -1833,7 +1906,8 @@ def export_projection(output_dir=OUTPUT_DIR):
             position = bubble.matrix_world.translation
             sample = project_to_pixel(body, position) or ("", "")
             writer.writerow((bubble.name, bubble["pixel_x"], bubble["pixel_z"], bubble["depth_fraction"],
-                             *position, *sample, int(bubble["vp_lit"]), bubble.get("vp_scattered_w", 0.0),
+                             *(position * scene.unit_settings.scale_length), *sample,
+                             int(bubble["vp_lit"]), bubble.get("vp_scattered_w", 0.0),
                              *list(bubble["vp_incident_color"])[:3]))
     nx, nz = body["vp_grid"]
     frame = projection_frame(scene, body)
@@ -1846,7 +1920,8 @@ def export_projection(output_dir=OUTPUT_DIR):
     finally:
         bpy.data.images.remove(image)
     metadata = {"model": "pinhole_color_sampling", "engine": scene.render.engine,
-                "parameters": {key: scene.get(key) for key in MODEL_KEYS + OPTICAL_KEYS},
+                "scene_meters_per_blender_unit": scene.unit_settings.scale_length,
+                "parameters": {key: scene.get(key) for key in MODEL_KEYS + OPTICAL_KEYS + SIZE_KEYS},
                 "content": scene.get("vp_content"), "power": body.get("power"),
                 "projector_matrix_world": [list(row) for row in body.matrix_world],
                 "source_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
@@ -1876,6 +1951,8 @@ def live_projection_tick():
                  body.get("power", 1.0), scene.get("vp_content"),
                  scene.get("vp_animation_radius"), scene.get("vp_animation_loop"),
                  scene.get("vp_animation_surface"),
+                 tuple(scene.get(key) for key in SIZE_KEYS), scene.unit_settings.scale_length,
+                 tuple(value for row in scene.objects[scene["vp_volume"]].matrix_world for value in row),
                  scene.get("vp_show_source_preview"), tuple(scene.get("vp_source_preview_offset", ())),
                  tuple(scene.get(key) for key in OPTICAL_KEYS),
                  tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_image", "vp_show_layers",
@@ -2063,7 +2140,19 @@ class VP_PT_controls(bpy.types.Panel):
         layout.operator("vp.load_image", icon="IMAGE_DATA")
         layout.operator("vp.load_animation", icon="IMPORT")
         layout.operator("vp.cube_animation", icon="MESH_CUBE")
+        if scene.get("vp_content") in {"IMAGE", "TEST", "COLOR_BARS", "WHITE"}:
+            layout.prop(scene, '["vp_depth_compensation"]', text="深度等尺寸补偿")
+            if scene.get("vp_depth_compensation"):
+                layout.prop(scene, '["vp_image_width_m"]', text="目标宽度 (m)")
+                layout.prop(scene, '["vp_image_height_m"]', text="目标高度 (m)")
+                layout.label(text=f"共像素冲突: {scene.get('vp_compensation_conflicts', 0)}")
+                layout.label(text=f"视场外点数: {scene.get('vp_compensation_unaddressed', 0)}")
         if scene.get("vp_animation_text"):
+            layout.prop(scene, '["vp_animation_actual_size"]', text="保持实际尺寸")
+            if scene.get("vp_animation_actual_size"):
+                layout.prop(scene, '["vp_animation_size_m"]', text="整段范围最长边 (m)")
+            if scene.get("vp_animation_outside_volume") and scene.get("vp_content") == "ANIMATION":
+                layout.label(text="目标超出玻璃范围", icon="ERROR")
             layout.prop(scene, '["vp_animation_radius"]', text="点云匹配半径")
             layout.prop(scene, '["vp_animation_surface"]', text="精确网格表面匹配")
             layout.prop(scene, '["vp_animation_loop"]', text="动画循环")

@@ -30,6 +30,7 @@ class AnimationTests(unittest.TestCase):
 
     def setUp(self):
         projection.load_point_animation(str(self.path))
+        self.scene["vp_animation_actual_size"] = False
         projection.projection_body()["power"] = 1.0
         self.scene["vp_flux_w"] = 180.0
         self.scene["vp_animation_radius"] = 0.18
@@ -238,6 +239,61 @@ class AnimationTests(unittest.TestCase):
         centroid = sum((Vector(preview["vertices"][i]) for i in tri[:3]), Vector()) / 3
         _, _, _, distance = projection._animation_cache["surface"].find_nearest(centroid)
         self.assertLess(distance, 1e-6)
+
+    def test_metric_export_and_import_restore_source_size(self):
+        projection.load_point_animation(str(self.path))
+        self.assertTrue(self.scene["vp_animation_actual_size"])
+        scale = self.data["meters_per_normalized_unit"]
+        self.assertAlmostEqual(scale * self.data["source"]["normalization_scale"], 1.0)
+        obj = self.scene.objects[self.scene["vp_source_preview_object"]]
+        edge = (obj.matrix_world @ obj.data.vertices[0].co -
+                obj.matrix_world @ obj.data.vertices[1].co).length
+        self.assertAlmostEqual(edge * self.scene.unit_settings.scale_length, 2.0, places=5)
+        self.assertTrue(self.scene["vp_animation_outside_volume"])
+        self.scene["vp_animation_size_m"] *= 0.5
+        projection.update_projection()
+        edge = (obj.matrix_world @ obj.data.vertices[0].co -
+                obj.matrix_world @ obj.data.vertices[1].co).length
+        self.assertAlmostEqual(edge, 1.0, places=5)
+        self.assertFalse(self.scene["vp_animation_outside_volume"])
+
+    def test_metric_size_independent_of_projector_distance_and_fov(self):
+        self.scene["vp_animation_actual_size"] = True
+        body = projection.projection_body()
+        old_location, old_fov = body.location.copy(), self.scene["vp_fov_x"]
+        self.scene["vp_freeze_points"] = True
+        positions = [tuple(o.matrix_world.translation) for o in self.bubbles()]
+        before = projection.animation_spatial_transform(self.scene)
+        try:
+            body.location.y += 2.0
+            self.scene["vp_fov_x"] *= 1.2
+            projection.update_projection()
+            self.assertEqual(before, projection.animation_spatial_transform(self.scene))
+            self.assertEqual(positions, [tuple(o.matrix_world.translation) for o in self.bubbles()])
+        finally:
+            body.location = old_location
+            self.scene["vp_fov_x"] = old_fov
+            self.scene["vp_freeze_points"] = False
+            projection.update_projection()
+
+    def test_metric_units_and_legacy_fallback(self):
+        old_unit = self.source.unit_settings.scale_length
+        try:
+            self.source.unit_settings.scale_length = 0.01
+            data = animation.export_animation(OUT / "cm.json", self.source, [self.cube], 20)
+            self.assertAlmostEqual(data["meters_per_normalized_unit"],
+                                   0.01 * self.data["meters_per_normalized_unit"])
+        finally:
+            self.source.unit_settings.scale_length = old_unit
+        legacy = dict(self.data)
+        del legacy["meters_per_normalized_unit"]
+        path = OUT / "no_units.json"
+        path.write_text(json.dumps(legacy), encoding="utf-8")
+        projection.load_point_animation(str(path))
+        self.assertFalse(self.scene["vp_animation_actual_size"])
+        for value in (0, -1, True, float("inf")):
+            with self.assertRaises(ValueError):
+                animation.validate(dict(self.data, meters_per_normalized_unit=value))
 
 
 suite = unittest.defaultTestLoader.loadTestsFromTestCase(AnimationTests)

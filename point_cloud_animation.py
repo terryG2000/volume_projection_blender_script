@@ -34,6 +34,11 @@ def validate(data):
         raise ValueError("Unsupported point animation format/version")
     if data.get("coordinates") != "normalized_isotropic" or data.get("color_space") != "linear_rgb":
         raise ValueError("Expected normalized_isotropic coordinates and linear_rgb")
+    metric_scale = data.get("meters_per_normalized_unit")
+    if "meters_per_normalized_unit" in data and (
+            isinstance(metric_scale, bool) or not isinstance(metric_scale, (int, float))
+            or not math.isfinite(metric_scale) or metric_scale <= 0):
+        raise ValueError("meters_per_normalized_unit must be finite and positive")
     fps = data.get("fps")
     if not isinstance(fps, (int, float)) or isinstance(fps, bool) or not math.isfinite(fps) or not 0 < fps <= 240:
         raise ValueError("FPS must be in (0, 240]")
@@ -170,6 +175,7 @@ def export_animation(filepath, scene, objects, samples=2048):
         for vertex in frame["preview"]["vertices"]:
             vertex[:] = [round((vertex[i] - center[i]) * scale, 6) for i in range(3)]
     data = {"format": FORMAT, "version": VERSION, "coordinates": "normalized_isotropic",
+            "meters_per_normalized_unit": scene.unit_settings.scale_length / scale,
             "color_space": "linear_rgb", "fps": scene.render.fps / scene.render.fps_base,
             "frames": frames, "source": {"blend": bpy.data.filepath, "scene": scene.name,
             "objects": [o.name for o in objects], "center_blender_units": list(center),
