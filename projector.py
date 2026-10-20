@@ -28,6 +28,7 @@ from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 import bpy
 from mathutils import Matrix, Vector
 from mathutils.kdtree import KDTree
+from mathutils.bvhtree import BVHTree
 from bpy.app.handlers import persistent
 
 
@@ -93,6 +94,7 @@ def load_point_animation(filepath):
     scene["vp_animation_text"] = text.name
     scene["vp_animation_path"] = str(filepath)
     scene["vp_animation_radius"] = 0.14
+    scene["vp_animation_surface"] = scene.get("vp_animation_surface", False)
     scene.id_properties_ui("vp_animation_radius").update(min=0.005, max=0.5)
     scene["vp_animation_loop"] = True
     scene["vp_show_source_preview"] = scene.get("vp_show_source_preview", True)
@@ -132,7 +134,11 @@ def point_animation_frame(scene, body):
         for i, point in enumerate(points):
             tree.insert(point[:3], i)
         tree.balance()
-        _animation_cache.update(index=index, tree=tree)
+        preview = data["frames"][index].get("preview")
+        surface = (BVHTree.FromPolygons(preview["vertices"],
+                   [tri[:3] for tri in preview["triangles"]], all_triangles=True)
+                   if preview and preview["triangles"] else None)
+        _animation_cache.update(index=index, tree=tree, surface=surface)
     tree = _animation_cache["tree"]
     nx, nz = body["vp_grid"]
     frame = {(x, z): (0.0, 0.0, 0.0, 1.0) for x in range(nx) for z in range(nz)}
@@ -154,9 +160,15 @@ def point_animation_frame(scene, body):
         if not points:
             continue
         position = rotation @ (bubble.matrix_world.translation - center) / half_extent
-        _, nearest, distance = tree.find(position)
-        if distance <= radius:
+        surface = _animation_cache.get("surface") if scene.get("vp_animation_surface", False) else None
+        if surface is not None:
+            _, _, nearest, distance = surface.find_nearest(position)
+            preview = data["frames"][index]["preview"]
+            rgb = preview["colors"][preview["triangles"][nearest][3]]
+        else:
+            _, nearest, distance = tree.find(position)
             rgb = points[nearest][3:]
+        if distance <= radius:
             # One projector pixel cannot independently address multiple depths.
             frame[pixel] = tuple(max(a, b) for a, b in zip(frame[pixel][:3], rgb)) + (1.0,)
     scene["vp_animation_frame"] = index + 1
@@ -1473,7 +1485,8 @@ def project_to_pixel(body, world_position):
 def ensure_optical_settings(reset=False):
     scene = bpy.context.scene
     defaults = {"vp_optics": True, "vp_flux_w": 180.0,
-                "vp_show_receiver": True, "vp_source_image": "", "vp_hide_ray_geometry": False}
+                "vp_show_receiver": True, "vp_source_image": "", "vp_hide_ray_geometry": False,
+                "vp_animation_surface": False}
     for key, value in defaults.items():
         if reset or key not in scene:
             scene[key] = value
@@ -1862,6 +1875,7 @@ def live_projection_tick():
                  parameters,
                  body.get("power", 1.0), scene.get("vp_content"),
                  scene.get("vp_animation_radius"), scene.get("vp_animation_loop"),
+                 scene.get("vp_animation_surface"),
                  scene.get("vp_show_source_preview"), tuple(scene.get("vp_source_preview_offset", ())),
                  tuple(scene.get(key) for key in OPTICAL_KEYS),
                  tuple(scene.get(key) for key in ("vp_show_rays", "vp_show_image", "vp_show_layers",
@@ -2051,6 +2065,7 @@ class VP_PT_controls(bpy.types.Panel):
         layout.operator("vp.cube_animation", icon="MESH_CUBE")
         if scene.get("vp_animation_text"):
             layout.prop(scene, '["vp_animation_radius"]', text="点云匹配半径")
+            layout.prop(scene, '["vp_animation_surface"]', text="精确网格表面匹配")
             layout.prop(scene, '["vp_animation_loop"]', text="动画循环")
             layout.label(text=f"动画帧 {scene.get('vp_animation_frame', 1)} / {scene.get('vp_animation_count', 0)}")
             layout.label(text=f"共像素气泡冲突: {scene.get('vp_animation_conflicts', 0)}")

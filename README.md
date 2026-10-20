@@ -73,14 +73,16 @@
 & 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' --python demo_rotating_cube.py
 ```
 
-示例创建独立的 `RotatingCubeSource` 源动画和 `VolumeProjection` 投影场景，六个面使用不同颜色，48 帧、24 FPS、每帧 1200 个表面样本。投影场景使用 32 x 24 个固定显示点；点云匹配半径为 0.18。
-生成文件为 `outputs/rotating_cube.pointcloud.json` 和 `outputs/rotating_cube_comparison.blend`。新版实体原动画与点云同屏展示，原 `rotating_cube_projection.blend` 保留不覆盖。它们是可重新生成的实验产物，不纳入 Git；JSON 的 `source` 记录源提交、工作树是否修改及导出器 SHA256。
+示例创建独立的 `RotatingCubeSource` 源动画和 `VolumeProjection` 投影场景，六个面使用不同颜色，48 帧、24 FPS、每帧 1200 个表面样本。清晰版使用 64 x 48 个显示点（旧版的四倍），匹配半径 0.10，开启“精确网格表面匹配”，隐藏接收屏以免背景投影干扰观察。播放时显示点位置不变；点数增加也会增加生成和刷新耗时，不保证实时 24 FPS。
+生成文件为 `outputs/rotating_cube.pointcloud.json` 和 `outputs/rotating_cube_clear.blend`。实体原动画与点云同屏展示，原 `rotating_cube_projection.blend`、`rotating_cube_comparison.blend` 保留不覆盖。它们是可重新生成的实验产物，不纳入 Git；JSON 的 `source` 记录源提交、工作树是否修改及导出器 SHA256。
+
+2026-10-20 验证：Blender 5.2.1 LTS 上 17 项动画、39 项静态回归和原有光学渲染检查通过；已检查清晰版第 1、13 帧预览。透明点云仍会叠加前后表面，不能获得不透明实体的遮挡效果；本次没有测量实时 FPS 或重跑降噪专项。
 加 `--background --python-exit-code 1` 并在脚本后传入 `-- --render-preview`，可后台生成第 1、13 帧的 PNG 对照；后台模式不会保留窗口。
 
 打开保存的测试场景并重新连接播放控制：
 
 ```powershell
-& 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' outputs/rotating_cube_comparison.blend --python projector.py -- --keep-open
+& 'G:\SteamLibrary\steamapps\common\Blender\blender.exe' outputs/rotating_cube_clear.blend --python projector.py -- --keep-open
 ```
 
 重新打开不会自动执行嵌入脚本；需要上面的 `--python` 重连。数据已压缩打包在 `.blend` 的 Text 数据块中，播放不依赖原 JSON 路径。不要直接编辑打包文本，修改数据后重新导入 JSON。
@@ -108,6 +110,7 @@
 - 用整段动画原始求值网格共用的包围盒进行一次等比例归一化到约 `[-0.8, 0.8]`，保留相对运动和大小，不逐帧居中。绝对世界位置与单位不直接送入玻璃，原始中心和缩放记录在元数据中。相比早期按随机表面样本求包围盒，重新导出的缩放可能略有变化。
 - RGB 是线性颜色，来自材质的 Viewport Display/Diffuse Color，缺少材质时使用对象颜色。不烘焙节点、纹理、灯光或透明度；带贴图的模型必须先另行烘焙/转换颜色，此版本不宣称复现完整渲染外观。
 - 导入的目标点云按玻璃最短边等比例居中放置。用 KDTree 查询气泡到最近目标表面样本的距离；半径是相对于玻璃最短半边长的比例。匹配后生成每个投影像素的 RGB，气泡、真实投影灯纹理与实体光线共用此帧。
+- 可选“精确网格表面匹配”：有嵌入网格时改用 BVH 查询最近三角面距离及该面的材质显示色，减少随机点样本空隙造成的漏点，不是移动气泡或增加独立深度寻址。没有网格的旧 JSON 自动使用原 KDTree；空点云帧仍保持黑色。默认导入保留原点云匹配行为，清晰版独立演示主动启用该选项。关闭“原始动画实体预览”不会关闭网格匹配。
 - 播放不移动气泡，也不把动画点直接伪装成可独立寻址的显示点。手动移动投影仪仍遵守原有设计/固定点模式。多气泡落入同一投影像素时按 RGB 分量最大值合并，它们会显示相同颜色，面板报告冲突数；单台投影仪不能在同一光线上独立控制不同深度。
 - 这是稀疏体积表面近似，不是连续实体或完整光学仿真。轮廓受气泡布局、点数、匹配半径和视角限制；源点增多不等于实际显示像素增多。
 - 使用时间轴 FPS 换算源帧，逐帧取样、不插值；开启循环时取模，关闭时超出范围保持首/尾帧。Blender 自身的时间轴循环仍由播放范围决定，取消此开关不会自动停止时间轴。修改目标 FPS 后需要自行调整播放结束帧。

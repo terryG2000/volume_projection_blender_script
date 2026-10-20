@@ -33,6 +33,7 @@ class AnimationTests(unittest.TestCase):
         projection.projection_body()["power"] = 1.0
         self.scene["vp_flux_w"] = 180.0
         self.scene["vp_animation_radius"] = 0.18
+        self.scene["vp_animation_surface"] = False
         projection.update_projection()
 
     def bubbles(self):
@@ -206,6 +207,10 @@ class AnimationTests(unittest.TestCase):
             self.assertTrue(obj.hide_render)
         self.scene.frame_set(13)
         self.assertGreater(self.scene["vp_lit_count"], 0)
+        colors = [tuple(o.color) for o in self.bubbles()]
+        self.scene["vp_animation_surface"] = True
+        projection.update_projection()
+        self.assertEqual(colors, [tuple(o.color) for o in self.bubbles()])
 
     def test_invalid_mesh_indices_rejected(self):
         preview = dict(self.data["frames"][0]["preview"], triangles=[[0, 1, 999999, 0]])
@@ -214,6 +219,25 @@ class AnimationTests(unittest.TestCase):
             animation.validate(bad)
         with self.assertRaises(ValueError):
             animation.validate(dict(self.data, frames=[dict(self.data["frames"][0], source_frame=None)]))
+
+    def test_exact_surface_preserves_points_and_pixel_colors(self):
+        positions = [tuple(o.matrix_world.translation) for o in self.bubbles()]
+        self.scene["vp_animation_surface"] = True
+        projection.update_projection()
+        self.assertIsNotNone(projection._animation_cache["surface"])
+        self.assertEqual(positions, [tuple(o.matrix_world.translation) for o in self.bubbles()])
+        self.test_texture_and_bubbles_share_projector_frame()
+        self.scene.frame_set(13)
+        self.assertEqual(positions, [tuple(o.matrix_world.translation) for o in self.bubbles()])
+
+    def test_exact_surface_distance_uses_triangles_not_random_samples(self):
+        projection.point_animation_frame(self.scene, projection.projection_body())
+        preview = self.data["frames"][0]["preview"]
+        from mathutils import Vector
+        tri = preview["triangles"][0]
+        centroid = sum((Vector(preview["vertices"][i]) for i in tri[:3]), Vector()) / 3
+        _, _, _, distance = projection._animation_cache["surface"].find_nearest(centroid)
+        self.assertLess(distance, 1e-6)
 
 
 suite = unittest.defaultTestLoader.loadTestsFromTestCase(AnimationTests)
